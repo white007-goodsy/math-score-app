@@ -21,7 +21,16 @@ import {
 // --- Firebase 클라우드 연동 임포트 ---
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, collection, onSnapshot, doc, setDoc, deleteDoc } from 'firebase/firestore';
+import {
+  getFirestore,
+  collection,
+  onSnapshot,
+  doc,
+  setDoc,
+  deleteDoc,
+  updateDoc,
+  deleteField
+} from "firebase/firestore";
 
 // --- 환경 감지 및 Firebase 설정 ---
 // Canvas(미리보기) 환경에서는 window.__firebase_config(JSON 문자열)가 주입될 수 있습니다.
@@ -202,36 +211,90 @@ export default function App() {
     addStudents: async (newStudents) => {
       if (!db) return;
       for (const student of newStudents) {
-        await setDoc(doc(db, 'artifacts', currentAppId, 'public', 'data', 'students', student.id), student);
+        await setDoc(doc(db, "artifacts", currentAppId, "public", "data", "students", student.id), student);
       }
     },
+
     deleteStudent: async (id) => {
       if (!db) return;
-      await deleteDoc(doc(db, 'artifacts', currentAppId, 'public', 'data', 'students', id));
+      await deleteDoc(doc(db, "artifacts", currentAppId, "public", "data", "students", id));
     },
+
     saveSession: async (session) => {
       if (!db) return;
-      await setDoc(doc(db, 'artifacts', currentAppId, 'public', 'data', 'sessions', session.id), session);
+      await setDoc(doc(db, "artifacts", currentAppId, "public", "data", "sessions", session.id), session);
     },
+
     deleteSession: async (id) => {
       if (!db) return;
-      await deleteDoc(doc(db, 'artifacts', currentAppId, 'public', 'data', 'sessions', id));
+      await deleteDoc(doc(db, "artifacts", currentAppId, "public", "data", "sessions", id));
     },
-    updateClassSettings: async (newSettings) => {
+
+    // ✅ 반×학습지 제출 설정 저장 (v2 구조로 정규화해서 저장)
+    updateClassSettings: async (rawSettings) => {
       if (!db) return;
-      await setDoc(doc(db, 'artifacts', currentAppId, 'public', 'data', 'settings', 'classActiveSettings'), newSettings);
+
+      const reserved = new Set(["version", "defaultByClass", "bySession", "updatedAt"]);
+      const input = rawSettings && typeof rawSettings === "object" ? rawSettings : {};
+
+      const hasV2 = input.defaultByClass || input.bySession;
+
+      // old 형태( { "경제A": true, "경제B": false } )면 v2로 변환
+      if (!hasV2) {
+        const normalized = {
+          version: 2,
+          defaultByClass: { ...input },
+          bySession: {},
+          updatedAt: Date.now(),
+        };
+        await setDoc(
+          doc(db, "artifacts", currentAppId, "public", "data", "settings", "classActiveSettings"),
+          normalized
+        );
+        return;
+      }
+
+      // v2 형태인데, 실수로 top-level에 반키가 들어온 경우 흡수
+      const defaultByClass = { ...(input.defaultByClass || {}) };
+      Object.keys(input).forEach((k) => {
+        if (!reserved.has(k) && typeof input[k] === "boolean") {
+          defaultByClass[k] = input[k];
+        }
+      });
+
+      const normalized = {
+        version: 2,
+        defaultByClass,
+        bySession: { ...(input.bySession || {}) },
+        updatedAt: Date.now(),
+      };
+
+      await setDoc(
+        doc(db, "artifacts", currentAppId, "public", "data", "settings", "classActiveSettings"),
+        normalized
+      );
     },
+
+    // ✅ 학생 제출 저장 (scoreData에 answers도 포함 가능)
     submitTest: async (studentId, sessionId, scoreData) => {
       if (!db) return;
       const student = students.find((s) => s.id === studentId);
       if (!student) return;
       const updatedStudent = { ...student, scores: { ...student.scores, [sessionId]: scoreData } };
       await setDoc(
-        doc(db, 'artifacts', currentAppId, 'public', 'data', 'students', studentId),
+        doc(db, "artifacts", currentAppId, "public", "data", "students", studentId),
         updatedStudent,
         { merge: true }
       );
-    }
+    },
+
+    // ✅ 제출 초기화(삭제) = 다시 제출 가능
+    resetSubmission: async (studentId, sessionId) => {
+      if (!db) return;
+      await updateDoc(doc(db, "artifacts", currentAppId, "public", "data", "students", studentId), {
+        [`scores.${sessionId}`]: deleteField(),
+      });
+    },
   };
 
   const handleAdminLogin = (password) => {
@@ -505,9 +568,9 @@ function AdminDashboard({ students, dbOps, sessions, classActiveSettings, logout
         )}
         {activeTab === 'sessions' && <AdminSessions sessions={sessions} dbOps={dbOps} />}
         {activeTab === 'controls' && (
-          <AdminControls students={students} classActiveSettings={classActiveSettings} dbOps={dbOps} />
+          <AdminControls students={students} sessions={sessions} classActiveSettings={classActiveSettings} dbOps={dbOps} />
         )}
-        {activeTab === 'scores' && <AdminScores students={students} sessions={sessions} />}
+        {activeTab === 'scores' && <AdminScores students={students} sessions={sessions} dbOps={dbOps} />}
       </div>
     </div>
   );
@@ -771,58 +834,155 @@ function AdminSessions({ sessions, dbOps }) {
   );
 }
 
-function AdminControls({ students, classActiveSettings, dbOps }) {
+function AdminControls({ students, sessions, classActiveSettings, dbOps }) {
   const classes = [...new Set(students.map((s) => s.classGroup))].sort((a, b) => a.localeCompare(b));
+  const [selectedSessionId, setSelectedSessionId] = useState("__default__"); // 기본(전체) or 특정 sessionId
 
-  const toggleClass = async (cls) => {
-    const newSettings = {
-      ...classActiveSettings,
-      [cls]: !classActiveSettings[cls]
-    };
-    await dbOps.updateClassSettings(newSettings);
+  // settings 읽기: old/v2 모두 대응
+  const getEnabled = (cls, sessionId) => {
+    const s = classActiveSettings || {};
+    const isV2 = s?.defaultByClass || s?.bySession;
+
+    if (!isV2) {
+      // old: { "경제A": true }
+      const v = s?.[cls];
+      return typeof v === "boolean" ? v : true;
+    }
+
+    const bySession = s.bySession?.[sessionId];
+    if (bySession && typeof bySession[cls] === "boolean") return bySession[cls];
+
+    const def = s.defaultByClass?.[cls];
+    if (typeof def === "boolean") return def;
+
+    return true;
+  };
+
+  const toggle = async (cls) => {
+    const current = getEnabled(cls, selectedSessionId);
+    const next = !current;
+
+    const s = classActiveSettings || {};
+    const isV2 = s?.defaultByClass || s?.bySession;
+
+    // v2로 맞춰서 업데이트할 객체 만들기
+    const nextSettings = isV2
+      ? { ...s, defaultByClass: { ...(s.defaultByClass || {}) }, bySession: { ...(s.bySession || {}) } }
+      : { version: 2, defaultByClass: { ...s }, bySession: {} };
+
+    if (selectedSessionId === "__default__") {
+      // 기본(전체) 반 스위치
+      nextSettings.defaultByClass[cls] = next;
+    } else {
+      // 특정 학습지(차시) 반 스위치
+      nextSettings.bySession[selectedSessionId] = {
+        ...(nextSettings.bySession[selectedSessionId] || {}),
+        [cls]: next,
+      };
+    }
+
+    await dbOps.updateClassSettings(nextSettings);
+  };
+
+  const setAll = async (value) => {
+    const s = classActiveSettings || {};
+    const isV2 = s?.defaultByClass || s?.bySession;
+
+    const nextSettings = isV2
+      ? { ...s, defaultByClass: { ...(s.defaultByClass || {}) }, bySession: { ...(s.bySession || {}) } }
+      : { version: 2, defaultByClass: { ...s }, bySession: {} };
+
+    if (selectedSessionId === "__default__") {
+      classes.forEach((cls) => (nextSettings.defaultByClass[cls] = value));
+    } else {
+      const map = { ...(nextSettings.bySession[selectedSessionId] || {}) };
+      classes.forEach((cls) => (map[cls] = value));
+      nextSettings.bySession[selectedSessionId] = map;
+    }
+
+    await dbOps.updateClassSettings(nextSettings);
   };
 
   return (
-    <div className="bg-white rounded-xl shadow-sm p-6 max-w-2xl">
-      <h2 className="text-2xl font-bold mb-2">반별 제출 활성화 관리 (실시간 연동)</h2>
-      <p className="text-gray-500 mb-6">스위치가 켜진(ON) 반의 학생들만 답안을 제출할 수 있습니다.</p>
+    <div className="bg-white rounded-xl shadow-sm p-6 max-w-3xl">
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <h2 className="text-2xl font-bold">반 × 학습지별 제출 ON/OFF</h2>
+
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setAll(true)}
+            className="px-3 py-2 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700"
+          >
+            모두 ON
+          </button>
+          <button
+            onClick={() => setAll(false)}
+            className="px-3 py-2 bg-red-600 text-white rounded-lg font-bold hover:bg-red-700"
+          >
+            모두 OFF
+          </button>
+        </div>
+      </div>
+
+      <p className="text-gray-500 mb-4">
+        “기본(전체)”은 모든 학습지에 적용되는 기본값이고, 특정 학습지를 선택하면 그 학습지에서만 반별로 따로 ON/OFF 할 수 있습니다.
+      </p>
+
+      <div className="flex items-center gap-2 mb-6">
+        <span className="text-sm font-bold text-gray-700">학습지 선택:</span>
+        <select
+          value={selectedSessionId}
+          onChange={(e) => setSelectedSessionId(e.target.value)}
+          className="p-2 border rounded-lg bg-gray-50 outline-none font-medium"
+        >
+          <option value="__default__">기본(전체)</option>
+          {sessions.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.title}
+            </option>
+          ))}
+        </select>
+      </div>
 
       {classes.length === 0 ? (
-        <div className="p-8 text-center text-gray-500 bg-gray-50 rounded-lg">등록된 학생이 없어 활성화할 반이 없습니다.</div>
+        <div className="p-8 text-center text-gray-500 bg-gray-50 rounded-lg">등록된 학생이 없어 반 목록이 없습니다.</div>
       ) : (
         <div className="space-y-3">
-          {classes.map((cls) => (
-            <div
-              key={cls}
-              className="flex items-center justify-between p-4 border border-gray-200 rounded-lg bg-gray-50 hover:bg-gray-100 transition-colors"
-            >
-              <span className="text-lg font-bold text-gray-800">{cls}</span>
-              <button
-                onClick={() => toggleClass(cls)}
-                className={`flex items-center gap-2 px-4 py-2 rounded-full font-bold transition-colors ${classActiveSettings[cls] !== false ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
-                  }`}
+          {classes.map((cls) => {
+            const enabled = getEnabled(cls, selectedSessionId);
+            return (
+              <div
+                key={cls}
+                className="flex items-center justify-between p-4 border border-gray-200 rounded-lg bg-gray-50 hover:bg-gray-100 transition-colors"
               >
-                {classActiveSettings[cls] !== false ? (
-                  <>
-                    <ToggleRight size={24} /> 제출 ON
-                  </>
-                ) : (
-                  <>
-                    <ToggleLeft size={24} /> 제출 OFF
-                  </>
-                )}
-              </button>
-            </div>
-          ))}
+                <span className="text-lg font-bold text-gray-800">{cls}</span>
+                <button
+                  onClick={() => toggle(cls)}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-full font-bold transition-colors ${enabled ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
+                    }`}
+                >
+                  {enabled ? (
+                    <>
+                      <ToggleRight size={24} /> 제출 ON
+                    </>
+                  ) : (
+                    <>
+                      <ToggleLeft size={24} /> 제출 OFF
+                    </>
+                  )}
+                </button>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
   );
 }
 
-function AdminScores({ students, sessions }) {
+function AdminScores({ students, sessions, dbOps }) {
   const classes = [...new Set(students.map((s) => s.classGroup))].sort((a, b) => a.localeCompare(b));
-  const [selectedClass, setSelectedClass] = useState(classes[0] || '');
+  const [selectedClass, setSelectedClass] = useState(classes[0] || "");
   const [reviewTarget, setReviewTarget] = useState(null);
 
   useEffect(() => {
@@ -835,63 +995,29 @@ function AdminScores({ students, sessions }) {
     .filter((s) => s.classGroup === selectedClass)
     .sort((a, b) => a.hakbun.localeCompare(b.hakbun));
 
-  // ✅ 엑셀 다운로드용 CSV 생성
-  const escapeCSV = (v) => {
-    const s = (v ?? '').toString();
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-
-  const downloadScoresCSV = () => {
-    const headers = ['반', '학번', '이름', '총점', ...sessions.map((s) => s.title)];
-    const rows = filteredStudents.map((st) => {
-      const total = sessions.reduce((sum, s) => sum + (Number(st.scores?.[s.id]?.score) || 0), 0);
-      const perSession = sessions.map((s) => st.scores?.[s.id]?.score ?? '');
-      return [st.classGroup, st.hakbun, st.name, total, ...perSession];
-    });
-
-    const csv =
-      '\ufeff' +
-      [headers, ...rows]
-        .map((r) => r.map(escapeCSV).join(','))
-        .join('\n');
-
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `성적_${selectedClass || '전체'}_${new Date().toISOString().slice(0, 10)}.csv`;
-    a.click();
-
-    URL.revokeObjectURL(url);
+  const resetOne = async (student, session) => {
+    const ok = window.confirm(
+      `${student.classGroup} ${student.hakbun} ${student.name} 학생의\n[${session.title}] 제출을 초기화할까요?\n(초기화 후 학생은 다시 제출할 수 있습니다)`
+    );
+    if (!ok) return;
+    await dbOps.resetSubmission(student.id, session.id);
   };
 
   return (
     <div className="bg-white rounded-xl shadow-sm p-6">
       <div className="flex justify-between items-center mb-6">
         <h2 className="text-2xl font-bold">학급별 실시간 성적 확인</h2>
-
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={downloadScoresCSV}
-            className="px-4 py-2 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700"
-          >
-            엑셀 다운로드(CSV)
-          </button>
-
-          <select
-            value={selectedClass}
-            onChange={(e) => setSelectedClass(e.target.value)}
-            className="p-2 border rounded-lg bg-gray-50 outline-none font-medium"
-          >
-            {classes.map((c) => (
-              <option key={c} value={c}>
-                {c} 성적 보기
-              </option>
-            ))}
-          </select>
-        </div>
+        <select
+          value={selectedClass}
+          onChange={(e) => setSelectedClass(e.target.value)}
+          className="p-2 border rounded-lg bg-gray-50 outline-none font-medium"
+        >
+          {classes.map((c) => (
+            <option key={c} value={c}>
+              {c} 성적 보기
+            </option>
+          ))}
+        </select>
       </div>
 
       {classes.length === 0 ? (
@@ -905,7 +1031,7 @@ function AdminScores({ students, sessions }) {
                 <th className="p-3 w-32">이름</th>
                 <th className="p-3 w-24 font-bold text-blue-700 border-r border-gray-200">총점</th>
                 {sessions.map((s) => (
-                  <th key={s.id} className="p-3 font-medium text-gray-700 min-w-[140px]">
+                  <th key={s.id} className="p-3 font-medium text-gray-700 min-w-[160px]">
                     {s.title}
                   </th>
                 ))}
@@ -929,8 +1055,7 @@ function AdminScores({ students, sessions }) {
                       return (
                         <td key={s.id} className="p-3">
                           {submission ? (
-                            <div className="flex flex-col items-center">
-                              {/* ✅ 점수 클릭하면 학생 답안/정답/맞틀 보기 */}
+                            <div className="flex flex-col items-center gap-1">
                               <button
                                 type="button"
                                 onClick={() => setReviewTarget({ student, session: s, submission })}
@@ -938,7 +1063,16 @@ function AdminScores({ students, sessions }) {
                               >
                                 {submission.score}점
                               </button>
-                              <span className="text-xs text-gray-400 mt-1">{submission.submittedAt}</span>
+                              <span className="text-xs text-gray-400">{submission.submittedAt}</span>
+
+                              {/* ✅ 초기화 버튼 */}
+                              <button
+                                type="button"
+                                onClick={() => resetOne(student, s)}
+                                className="mt-1 text-xs px-2 py-1 rounded bg-red-100 text-red-700 font-bold hover:bg-red-200"
+                              >
+                                초기화(재제출)
+                              </button>
                             </div>
                           ) : (
                             <span className="text-gray-300 text-sm">미제출</span>
@@ -962,7 +1096,7 @@ function AdminScores({ students, sessions }) {
         studentLabel={
           reviewTarget?.student
             ? `${reviewTarget.student.classGroup} ${reviewTarget.student.hakbun} ${reviewTarget.student.name}`
-            : ''
+            : ""
         }
       />
     </div>
@@ -970,18 +1104,36 @@ function AdminScores({ students, sessions }) {
 }
 
 function StudentDashboard({ currentUser, sessions, setView, setCurrentSessionId, logout, classActiveSettings }) {
-  const isClassActive = classActiveSettings[currentUser.classGroup] !== false;
-
-  // ✅ 총점 계산을 scores 기준으로 안정적으로 계산
   const [reviewTarget, setReviewTarget] = useState(null);
+
+  // ✅ 총점은 scores 기준으로 안정 계산
   const totalScore = Object.values(currentUser.scores || {}).reduce(
     (sum, v) => sum + (Number(v?.score) || 0),
     0
   );
 
+  // ✅ old/v2 설정 모두 대응: (반, 학습지) 제출 가능 여부
+  const canSubmit = (classGroup, sessionId) => {
+    const s = classActiveSettings || {};
+    const isV2 = s?.defaultByClass || s?.bySession;
+
+    if (!isV2) {
+      const v = s?.[classGroup];
+      return typeof v === "boolean" ? v : true;
+    }
+
+    const bySession = s.bySession?.[sessionId];
+    if (bySession && typeof bySession[classGroup] === "boolean") return bySession[classGroup];
+
+    const def = s.defaultByClass?.[classGroup];
+    if (typeof def === "boolean") return def;
+
+    return true;
+  };
+
   const handleStartTest = (sessionId) => {
     setCurrentSessionId(sessionId);
-    setView('test');
+    setView("test");
   };
 
   return (
@@ -1016,6 +1168,7 @@ function StudentDashboard({ currentUser, sessions, setView, setCurrentSessionId,
         </div>
 
         <h1 className="text-2xl font-bold mb-6">학습지 목록</h1>
+
         <div className="grid gap-4">
           {sessions.length === 0 ? (
             <div className="bg-white p-10 text-center rounded-xl border border-gray-200 text-gray-500">
@@ -1025,19 +1178,18 @@ function StudentDashboard({ currentUser, sessions, setView, setCurrentSessionId,
             sessions.map((session) => {
               const submission = currentUser.scores?.[session.id];
               const isCompleted = submission !== undefined;
+              const isOpen = canSubmit(currentUser.classGroup, session.id);
 
               return (
                 <div
                   key={session.id}
-                  className={`bg-white p-6 rounded-xl shadow-sm border ${
-                    isCompleted ? 'border-green-200 bg-green-50/30' : 'border-gray-200'
-                  } flex flex-col sm:flex-row items-center justify-between gap-4 hover:shadow-md transition-shadow`}
+                  className={`bg-white p-6 rounded-xl shadow-sm border ${isCompleted ? "border-green-200 bg-green-50/30" : "border-gray-200"
+                    } flex flex-col sm:flex-row items-center justify-between gap-4 hover:shadow-md transition-shadow`}
                 >
                   <div className="flex items-center gap-4 w-full sm:w-auto">
                     <div
-                      className={`w-12 h-12 shrink-0 rounded-full flex items-center justify-center ${
-                        isCompleted ? 'bg-green-100 text-green-600' : 'bg-blue-100 text-blue-600'
-                      }`}
+                      className={`w-12 h-12 shrink-0 rounded-full flex items-center justify-center ${isCompleted ? "bg-green-100 text-green-600" : "bg-blue-100 text-blue-600"
+                        }`}
                     >
                       {isCompleted ? <CheckCircle size={24} /> : <FileText size={24} />}
                     </div>
@@ -1057,7 +1209,6 @@ function StudentDashboard({ currentUser, sessions, setView, setCurrentSessionId,
                     {isCompleted ? (
                       <div className="text-right sm:text-center w-full">
                         <span className="block text-xs text-gray-500 mb-1">내 점수</span>
-                        {/* ✅ 점수 클릭하면 답안/정답/맞틀 보기 */}
                         <button
                           type="button"
                           onClick={() => setReviewTarget({ session, submission })}
@@ -1066,7 +1217,7 @@ function StudentDashboard({ currentUser, sessions, setView, setCurrentSessionId,
                           {submission.score}점
                         </button>
                       </div>
-                    ) : isClassActive ? (
+                    ) : isOpen ? (
                       <button
                         onClick={() => handleStartTest(session.id)}
                         className="w-full sm:w-auto bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-semibold transition-colors shadow-sm"
@@ -1089,6 +1240,7 @@ function StudentDashboard({ currentUser, sessions, setView, setCurrentSessionId,
         </div>
       </main>
 
+      {/* 답안/정답/맞틀 모달(이전에 추가한 것) */}
       <AnswerReviewModal
         open={Boolean(reviewTarget)}
         onClose={() => setReviewTarget(null)}
