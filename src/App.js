@@ -23,10 +23,9 @@ import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
   getAuth,
   signInAnonymously,
-  signInWithCustomToken,
   onAuthStateChanged,
-  GoogleAuthProvider,
-  signInWithPopup
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
   signOut
 } from "firebase/auth";
 import {
@@ -35,6 +34,7 @@ import {
   onSnapshot,
   doc,
   setDoc,
+  getDoc,
   deleteDoc,
   updateDoc,
   deleteField
@@ -122,6 +122,9 @@ export default function App() {
     await signInWithPopup(auth, provider);
   };
 
+  const [teacherStatus, setTeacherStatus] = useState("none");
+  // "none" | "pending" | "approved"
+  const [teacherEmail, setTeacherEmail] = useState("");
   // --- 클라우드 실시간 데이터 저장소 ---
   const [students, setStudents] = useState([]);
   const [sessions, setSessions] = useState([]);
@@ -176,6 +179,45 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const run = async () => {
+      if (!firebaseUser || !db) return;
+
+      // 익명 로그인(학생용)인 경우는 교사 체크 안 함
+      if (firebaseUser.isAnonymous) {
+        setTeacherStatus("none");
+        return;
+      }
+
+      const email = firebaseUser.email || "";
+      setTeacherEmail(email);
+
+      const tRef = doc(db, "artifacts", currentAppId, "private", "data", "teachers", firebaseUser.uid);
+      const snap = await getDoc(tRef);
+
+      // teachers 문서가 없으면: 자동으로 pending 생성(승인요청)
+      if (!snap.exists()) {
+        await setDoc(tRef, { email, status: "pending", createdAt: Date.now() });
+        setTeacherStatus("pending");
+        setView("teacherPending");
+        return;
+      }
+
+      const status = snap.data()?.status || "pending";
+
+      if (status === "approved") {
+        setTeacherStatus("approved");
+        setCurrentUser({ role: "admin", uid: firebaseUser.uid, email });
+        setView("admin");
+      } else {
+        setTeacherStatus("pending");
+        setView("teacherPending");
+      }
+    };
+
+    run();
+  }, [firebaseUser, db]);
+
+  useEffect(() => {
     if (!firebaseUser || !db) return;
 
     // 클라우드 컬렉션 경로 지정
@@ -218,6 +260,41 @@ export default function App() {
       unsubSettings();
     };
   }, [firebaseUser]);
+
+  const teacherSignup = async (email, password) => {
+    if (!auth || !db) return;
+
+    const cred = await createUserWithEmailAndPassword(auth, email, password);
+
+    // teachers/{uid} 문서 생성 (승인대기)
+    const tRef = doc(db, "artifacts", currentAppId, "private", "data", "teachers", cred.user.uid);
+    await setDoc(tRef, {
+      email,
+      status: "pending",
+      createdAt: Date.now(),
+    });
+
+    setTeacherEmail(email);
+    setTeacherStatus("pending");
+    setView("teacherPending");
+  };
+
+  const teacherLogin = async (email, password) => {
+    if (!auth) return;
+    await signInWithEmailAndPassword(auth, email, password);
+    // 로그인 후 권한 체크는 onAuthStateChanged에서 자동 처리
+  };
+
+  const teacherLogout = async () => {
+    if (!auth) return;
+    await signOut(auth);
+    // 학생 기능 유지하려면 익명 로그인으로 복귀
+    await signInAnonymously(auth);
+    setTeacherStatus("none");
+    setTeacherEmail("");
+    setCurrentUser(null);
+    setView("login");
+  };
 
   // --- 2. 클라우드 데이터베이스 쓰기 함수 묶음 ---
   const dbOps = {
@@ -395,10 +472,13 @@ export default function App() {
     <div className="min-h-screen bg-gray-50 text-gray-800 font-sans">
       {view === "login" && (
         <LoginScreen
-          onTeacherGoogleLogin={teacherLoginWithGoogle}
+          onTeacherLogin={teacherLogin}
+          onTeacherSignup={teacherSignup}
           onStudentLogin={handleStudentLogin}
-          teacherDeniedInfo={teacherDeniedInfo}
         />
+      )}
+      {view === "teacherPending" && (
+        <TeacherPendingScreen email={teacherEmail} onLogout={teacherLogout} />
       )}
       {view === 'admin' && (
         <AdminDashboard
@@ -438,16 +518,29 @@ export default function App() {
 // UI 컴포넌트들 (LoginScreen, AdminDashboard 등)
 // ---------------------------------------------------------
 
-function LoginScreen({ onTeacherGoogleLogin, onStudentLogin, teacherDeniedInfo }) {
-  const [mode, setMode] = useState(null);
-  const [inputValue, setInputValue] = useState("");
+function LoginScreen({ onTeacherLogin, onTeacherSignup, onStudentLogin }) {
+  const [mode, setMode] = useState(null); // null | "student" | "teacher"
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+  const [studentCode, setStudentCode] = useState("");
+  const [isSignup, setIsSignup] = useState(false);
   const [error, setError] = useState("");
 
-  const handleStudentSubmit = (e) => {
+  const submitTeacher = async () => {
+    setError("");
+    try {
+      if (isSignup) await onTeacherSignup(email, pw);
+      else await onTeacherLogin(email, pw);
+    } catch (e) {
+      setError(e?.message || "로그인/회원가입 실패");
+    }
+  };
+
+  const submitStudent = (e) => {
     e.preventDefault();
     setError("");
-    const success = onStudentLogin(inputValue);
-    if (!success) setError("유효하지 않은 개인코드입니다. 대소문자를 확인해 주세요.");
+    const ok = onStudentLogin(studentCode);
+    if (!ok) setError("유효하지 않은 개인코드입니다.");
   };
 
   if (!mode) {
@@ -459,14 +552,14 @@ function LoginScreen({ onTeacherGoogleLogin, onStudentLogin, teacherDeniedInfo }
           <div className="space-y-4 mt-8">
             <button
               onClick={() => setMode("student")}
-              className="w-full py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold text-lg transition-colors"
+              className="w-full py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold text-lg"
             >
               학생 로그인
             </button>
 
             <button
               onClick={() => setMode("teacher")}
-              className="w-full py-4 bg-white border-2 border-gray-200 hover:border-gray-300 text-gray-700 rounded-xl font-semibold text-lg transition-colors"
+              className="w-full py-4 bg-white border-2 border-gray-200 hover:border-gray-300 text-gray-700 rounded-xl font-semibold text-lg"
             >
               교사 로그인
             </button>
@@ -484,73 +577,88 @@ function LoginScreen({ onTeacherGoogleLogin, onStudentLogin, teacherDeniedInfo }
     return (
       <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
         <div className="bg-white p-10 rounded-2xl shadow-xl w-full max-w-md">
-          <button
-            onClick={() => setMode(null)}
-            className="text-sm text-gray-500 hover:text-gray-800 mb-6"
-          >
+          <button onClick={() => setMode(null)} className="text-sm text-gray-500 hover:text-gray-800 mb-6">
             ← 뒤로 가기
           </button>
 
-          <h2 className="text-2xl font-bold text-gray-800 mb-4 text-center">교사 로그인</h2>
+          <h2 className="text-2xl font-bold text-gray-800 mb-4 text-center">
+            {isSignup ? "교사 회원가입(승인요청)" : "교사 로그인"}
+          </h2>
+
+          <div className="flex gap-2 mb-4">
+            <button
+              className={`flex-1 py-2 rounded-lg font-bold ${!isSignup ? "bg-blue-600 text-white" : "bg-gray-100"}`}
+              onClick={() => setIsSignup(false)}
+            >
+              로그인
+            </button>
+            <button
+              className={`flex-1 py-2 rounded-lg font-bold ${isSignup ? "bg-blue-600 text-white" : "bg-gray-100"}`}
+              onClick={() => setIsSignup(true)}
+            >
+              회원가입
+            </button>
+          </div>
+
+          <label className="block text-sm font-medium text-gray-700 mb-1">이메일</label>
+          <input
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            className="w-full px-4 py-3 border border-gray-300 rounded-lg mb-3"
+            placeholder="teacher@email.com"
+          />
+
+          <label className="block text-sm font-medium text-gray-700 mb-1">비밀번호</label>
+          <input
+            type="password"
+            value={pw}
+            onChange={(e) => setPw(e.target.value)}
+            className="w-full px-4 py-3 border border-gray-300 rounded-lg mb-4"
+            placeholder="비밀번호"
+          />
+
+          {error && <div className="text-red-500 text-sm mb-3">{error}</div>}
 
           <button
-            onClick={onTeacherGoogleLogin}
-            className="w-full py-4 bg-gray-900 hover:bg-black text-white rounded-xl font-bold transition-colors"
+            onClick={submitTeacher}
+            className="w-full py-3 bg-gray-900 hover:bg-black text-white rounded-lg font-bold"
           >
-            Google로 로그인
+            {isSignup ? "가입하고 승인요청" : "로그인"}
           </button>
 
-          {teacherDeniedInfo && (
-            <div className="mt-4 p-4 rounded-lg bg-yellow-50 border border-yellow-200 text-sm text-yellow-800">
-              <div className="font-bold mb-1">교사 권한이 없습니다.</div>
-              <div>관리자에게 아래 정보를 보내서 교사 등록을 요청하세요.</div>
-              <div className="mt-2 font-mono text-xs">
-                UID: {teacherDeniedInfo.uid}
-                <br />
-                Email: {teacherDeniedInfo.email || "-"}
-              </div>
-            </div>
-          )}
+          <p className="text-xs text-gray-500 mt-3">
+            회원가입 후에는 관리자가 승인해야 교사 화면을 사용할 수 있습니다.
+          </p>
         </div>
       </div>
     );
   }
 
+  // 학생
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
       <div className="bg-white p-10 rounded-2xl shadow-xl w-full max-w-md">
-        <button
-          onClick={() => {
-            setMode(null);
-            setError("");
-            setInputValue("");
-          }}
-          className="text-sm text-gray-500 hover:text-gray-800 mb-6"
-        >
+        <button onClick={() => setMode(null)} className="text-sm text-gray-500 hover:text-gray-800 mb-6">
           ← 뒤로 가기
         </button>
 
         <h2 className="text-2xl font-bold text-gray-800 mb-6 text-center">학생 로그인</h2>
 
-        <form onSubmit={handleStudentSubmit} className="space-y-4">
+        <form onSubmit={submitStudent} className="space-y-4">
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">부여받은 개인코드 (4자리)</label>
+            <label className="block text-sm font-medium text-gray-700 mb-1">개인코드</label>
             <input
-              type="text"
-              value={inputValue}
-              onChange={(e) => setInputValue(e.target.value)}
-              placeholder="예: A001"
+              value={studentCode}
+              onChange={(e) => setStudentCode(e.target.value)}
               className="w-full px-4 py-3 border border-gray-300 rounded-lg outline-none uppercase"
+              placeholder="예: A001"
               autoFocus
             />
           </div>
 
           {error && <p className="text-red-500 text-sm">{error}</p>}
 
-          <button
-            type="submit"
-            className="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold transition-colors"
-          >
+          <button type="submit" className="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold">
             로그인
           </button>
         </form>
@@ -1600,6 +1708,23 @@ function AnswerReviewModal({ open, onClose, session, submission, studentLabel })
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function TeacherPendingScreen({ email, onLogout }) {
+  return (
+    <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50 p-6 text-center">
+      <h2 className="text-2xl font-bold text-gray-800 mb-2">승인 대기 중</h2>
+      <p className="text-gray-600 mb-6">
+        교사 계정 <span className="font-mono font-bold">{email || "-"}</span> 은(는) 아직 관리자 승인이 필요합니다.
+      </p>
+      <button
+        onClick={onLogout}
+        className="px-6 py-3 bg-gray-900 text-white rounded-lg font-bold hover:bg-black"
+      >
+        로그아웃
+      </button>
     </div>
   );
 }
