@@ -1,25 +1,920 @@
-import logo from './logo.svg';
-import './App.css';
+import React, { useState, useEffect } from 'react';
+import { Users, FileText, BarChart, LogOut, CheckCircle, Upload, Plus, Lock, Key, FileCheck, X, Settings, ToggleLeft, ToggleRight, AlertCircle, Clock, Loader } from 'lucide-react';
 
-function App() {
-  return (
-    <div className="App">
-      <header className="App-header">
-        <img src={logo} className="App-logo" alt="logo" />
-        <p>
-          Edit <code>src/App.js</code> and save to reload.
+// --- Firebase 클라우드 연동 임포트 ---
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, onSnapshot, doc, setDoc, deleteDoc } from 'firebase/firestore';
+
+// --- 환경 감지 및 Firebase 설정 ---
+// 현재 화면 우측의 캔버스(미리보기) 환경인지 판별합니다.
+const isCanvasEnv = typeof __firebase_config !== 'undefined';
+
+// 캔버스 환경에서는 자동 주입된 설정을 사용하고, 외부(코드샌드박스 등)에서는 아래 선생님의 코드를 사용합니다.
+const firebaseConfig = {
+  apiKey: "AIzaSyCpUMlVnv8fvYlJAeIK_pUvCp0LXrdiWuI",
+  authDomain: "math-score-app.firebaseapp.com",
+  projectId: "math-score-app",
+  storageBucket: "math-score-app.firebasestorage.app",
+  messagingSenderId: "1086310377555",
+  appId: "1:1086310377555:web:aacffbdd631164dde9fea6"
+};
+
+// 중복 실행 방지 및 초기화
+const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
+const auth = getAuth(app);
+const db = getFirestore(app);
+const currentAppId = typeof __app_id !== 'undefined' ? __app_id : (firebaseConfig.projectId || "math-score-app");
+
+// --- 유틸리티: 날짜 포맷 함수 ---
+const formatSubmitDate = () => {
+  const dateObj = new Date();
+  const yy = String(dateObj.getFullYear()).slice(-2);
+  const mm = String(dateObj.getMonth() + 1).padStart(2, '0');
+  const dd = String(dateObj.getDate()).padStart(2, '0');
+  const days = ['일', '월', '화', '수', '목', '금', '토'];
+  const day = days[dateObj.getDay()];
+  let h = dateObj.getHours();
+  const ampm = h >= 12 ? 'pm' : 'am';
+  h = h ? h : 12;
+  const min = String(dateObj.getMinutes()).padStart(2, '0');
+  
+  return `${yy}.${mm}.${dd}(${day}) ${ampm} ${h}:${min}`;
+};
+
+export default function App() {
+  // --- 앱 상태 관리 ---
+  const [firebaseUser, setFirebaseUser] = useState(null);
+  const [isDbReady, setIsDbReady] = useState(false);
+  const [configError, setConfigError] = useState(false);
+  const [authErrorMsg, setAuthErrorMsg] = useState(''); // 통신 장애 에러 메시지 상태 추가
+  const [view, setView] = useState('login'); // 'login', 'admin', 'student', 'test'
+  const [currentUser, setCurrentUser] = useState(null);
+  
+  // --- 클라우드 실시간 데이터 저장소 ---
+  const [students, setStudents] = useState([]);
+  const [sessions, setSessions] = useState([]);
+  const [classActiveSettings, setClassActiveSettings] = useState({});
+
+  const [currentSessionId, setCurrentSessionId] = useState(null);
+  const [testResult, setTestResult] = useState(null);
+
+  // --- 1. Firebase 인증 및 실시간 리스너 연결 ---
+  useEffect(() => {
+    const initAuth = async () => {
+      // 코드샌드박스 등 외부 환경인데 API 키가 여전히 한글(초기값)인 경우 에러 화면 표시
+      if (!isCanvasEnv && firebaseConfig.apiKey.includes("여기에")) {
+        setConfigError(true);
+        return;
+      }
+
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("인증 오류:", error);
+        // 네트워크 차단 오류 발생 시 구체적인 안내 메시지 제공
+        if (error.code === 'auth/network-request-failed') {
+          setAuthErrorMsg('네트워크 연결이 차단되었습니다. 학교/관공서 방화벽이거나 브라우저의 광고 차단 프로그램(AdBlock)이 원인일 수 있습니다.');
+        } else {
+          setAuthErrorMsg(`데이터베이스 인증에 실패했습니다: ${error.message}`);
+        }
+      }
+    };
+    initAuth();
+    
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (user) setFirebaseUser(user);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!firebaseUser) return;
+
+    // 클라우드 컬렉션 경로 지정
+    const studentsRef = collection(db, 'artifacts', currentAppId, 'public', 'data', 'students');
+    const sessionsRef = collection(db, 'artifacts', currentAppId, 'public', 'data', 'sessions');
+    const settingsRef = collection(db, 'artifacts', currentAppId, 'public', 'data', 'settings');
+
+    // 실시간 구독
+    const unsubStudents = onSnapshot(studentsRef, (snap) => {
+      setStudents(snap.docs.map(d => d.data()));
+    }, (err) => console.error(err));
+
+    const unsubSessions = onSnapshot(sessionsRef, (snap) => {
+      setSessions(snap.docs.map(d => d.data()));
+    }, (err) => console.error(err));
+
+    const unsubSettings = onSnapshot(settingsRef, (snap) => {
+      const docSnap = snap.docs.find(d => d.id === 'classActiveSettings');
+      if (docSnap) {
+        setClassActiveSettings(docSnap.data());
+      }
+      setIsDbReady(true);
+    }, (err) => console.error(err));
+
+    return () => { unsubStudents(); unsubSessions(); unsubSettings(); };
+  }, [firebaseUser]);
+
+  // --- 2. 클라우드 데이터베이스 쓰기 함수 묶음 ---
+  const dbOps = {
+    addStudents: async (newStudents) => {
+      for (const student of newStudents) {
+        await setDoc(doc(db, 'artifacts', currentAppId, 'public', 'data', 'students', student.id), student);
+      }
+    },
+    deleteStudent: async (id) => {
+      await deleteDoc(doc(db, 'artifacts', currentAppId, 'public', 'data', 'students', id));
+    },
+    saveSession: async (session) => {
+      await setDoc(doc(db, 'artifacts', currentAppId, 'public', 'data', 'sessions', session.id), session);
+    },
+    deleteSession: async (id) => {
+      await deleteDoc(doc(db, 'artifacts', currentAppId, 'public', 'data', 'sessions', id));
+    },
+    updateClassSettings: async (newSettings) => {
+      await setDoc(doc(db, 'artifacts', currentAppId, 'public', 'data', 'settings', 'classActiveSettings'), newSettings);
+    },
+    submitTest: async (studentId, sessionId, scoreData) => {
+      const student = students.find(s => s.id === studentId);
+      if(!student) return;
+      const updatedStudent = { ...student, scores: { ...student.scores, [sessionId]: scoreData } };
+      await setDoc(doc(db, 'artifacts', currentAppId, 'public', 'data', 'students', studentId), updatedStudent, { merge: true });
+    }
+  };
+
+  const handleAdminLogin = (password) => {
+    if (password === 'admin1234') {
+      setCurrentUser({ role: 'admin' });
+      setView('admin');
+      return true;
+    }
+    return false;
+  };
+
+  const handleStudentLogin = (code) => {
+    const student = students.find(s => s.code === code.toUpperCase());
+    if (student) {
+      setCurrentUser({ role: 'student', ...student });
+      setView('student');
+      return true;
+    }
+    return false;
+  };
+
+  const logout = () => {
+    setCurrentUser(null);
+    setView('login');
+  };
+
+  const getUpdatedCurrentUser = () => {
+    if (currentUser?.role === 'student') {
+      return students.find(s => s.id === currentUser.id) || currentUser;
+    }
+    return currentUser;
+  };
+
+  // 1. 코드 초기화 에러 처리 화면
+  if (configError) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50 p-6 text-center">
+        <AlertCircle className="text-red-500 mb-4" size={48} />
+        <h2 className="text-2xl font-bold text-gray-800 mb-2">파이어베이스 연결 정보가 필요합니다</h2>
+        <p className="text-gray-600 max-w-md">
+          코드샌드박스 등 외부 환경에서 실행하시려면 코드 13번째 줄 부근의 <strong className="text-gray-900">firebaseConfig</strong> 부분을 선생님의 파이어베이스 정보로 수정해주세요.
         </p>
-        <a
-          className="App-link"
-          href="https://reactjs.org"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Learn React
-        </a>
-      </header>
+      </div>
+    );
+  }
+
+  // 2. 네트워크 및 인증 통신 에러 처리 화면
+  if (authErrorMsg) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50 p-6 text-center">
+        <AlertCircle className="text-red-500 mb-4" size={48} />
+        <h2 className="text-2xl font-bold text-gray-800 mb-2">접속 오류 발생</h2>
+        <p className="text-gray-600 max-w-md mb-6 leading-relaxed">
+          {authErrorMsg}
+        </p>
+        <div className="bg-white p-4 rounded-lg shadow-sm border border-gray-200 text-left text-sm text-gray-700 max-w-md w-full">
+          <strong className="block text-gray-900 mb-2">해결 방법:</strong>
+          <ul className="list-disc pl-5 space-y-1">
+            <li>스마트폰 모바일 데이터(LTE/5G)로 연결하여 테스트해 보세요.</li>
+            <li>브라우저에 설치된 광고 차단 프로그램(AdBlock 등)을 잠시 꺼주세요.</li>
+            <li>Brave 브라우저의 경우 주소창 우측의 방패(실드) 아이콘을 눌러 해제해 주세요.</li>
+          </ul>
+        </div>
+      </div>
+    );
+  }
+
+  // 3. 정상 로딩 중 화면
+  if (!isDbReady) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50">
+        <Loader className="animate-spin text-blue-600 mb-4" size={48} />
+        <h2 className="text-xl font-bold text-gray-700">클라우드 데이터베이스 연결 중...</h2>
+        <p className="text-gray-500 mt-2">잠시만 기다려주세요.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 text-gray-800 font-sans">
+      {view === 'login' && <LoginScreen onAdminLogin={handleAdminLogin} onStudentLogin={handleStudentLogin} />}
+      {view === 'admin' && <AdminDashboard students={students} dbOps={dbOps} sessions={sessions} classActiveSettings={classActiveSettings} logout={logout} />}
+      {view === 'student' && <StudentDashboard currentUser={getUpdatedCurrentUser()} sessions={sessions} setView={setView} setCurrentSessionId={setCurrentSessionId} logout={logout} classActiveSettings={classActiveSettings} />}
+      {view === 'test' && <TestScreen currentUser={getUpdatedCurrentUser()} sessionId={currentSessionId} sessions={sessions} dbOps={dbOps} setView={setView} testResult={testResult} setTestResult={setTestResult} />}
     </div>
   );
 }
 
-export default App;
+// ---------------------------------------------------------
+// UI 컴포넌트들 (LoginScreen, AdminDashboard 등)
+// ---------------------------------------------------------
+
+function LoginScreen({ onAdminLogin, onStudentLogin }) {
+  const [mode, setMode] = useState(null);
+  const [inputValue, setInputValue] = useState('');
+  const [error, setError] = useState('');
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    setError('');
+    
+    if (mode === 'admin') {
+      const success = onAdminLogin(inputValue);
+      if (!success) setError('비밀번호가 일치하지 않습니다.');
+    } else if (mode === 'student') {
+      const success = onStudentLogin(inputValue);
+      if (!success) setError('유효하지 않은 개인코드입니다. 대소문자를 확인해 주세요.');
+    }
+  };
+
+  if (!mode) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
+        <div className="bg-white p-10 rounded-2xl shadow-xl w-full max-w-md text-center">
+          <div className="w-16 h-16 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center mx-auto mb-6">
+            <FileCheck size={32} />
+          </div>
+          <h1 className="text-3xl font-bold text-gray-800 mb-2">수학 평가 시스템</h1>
+          <p className="text-green-600 font-semibold mb-8 flex justify-center items-center gap-1 text-sm">
+            <CheckCircle size={16} /> 클라우드 실시간 동기화 ON
+          </p>
+          
+          <div className="space-y-4">
+            <button onClick={() => setMode('student')} className="w-full py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold text-lg transition-colors flex items-center justify-center gap-2">
+              <Users size={24} /> 학생 로그인
+            </button>
+            <button onClick={() => setMode('admin')} className="w-full py-4 bg-white border-2 border-gray-200 hover:border-gray-300 text-gray-700 rounded-xl font-semibold text-lg transition-colors flex items-center justify-center gap-2">
+              <Lock size={24} /> 교사 로그인
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
+      <div className="bg-white p-10 rounded-2xl shadow-xl w-full max-w-md">
+        <button onClick={() => { setMode(null); setError(''); setInputValue(''); }} className="text-sm text-gray-500 hover:text-gray-800 mb-6 flex items-center gap-1">
+           ← 뒤로 가기
+        </button>
+        <h2 className="text-2xl font-bold text-gray-800 mb-6 text-center">
+          {mode === 'admin' ? '교사 로그인' : '학생 로그인'}
+        </h2>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              {mode === 'admin' ? '관리자 비밀번호' : '부여받은 개인코드 (4자리)'}
+            </label>
+            <input
+              type={mode === 'admin' ? 'password' : 'text'}
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
+              placeholder={mode === 'admin' ? "비밀번호 입력 (기본: admin1234)" : "예: A001"}
+              className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none uppercase"
+              autoFocus
+            />
+          </div>
+          {error && <p className="text-red-500 text-sm">{error}</p>}
+          <button type="submit" className="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold transition-colors">
+            로그인
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function AdminDashboard({ students, dbOps, sessions, classActiveSettings, logout }) {
+  const [activeTab, setActiveTab] = useState('students');
+
+  return (
+    <div className="flex h-screen bg-gray-100">
+      <div className="w-64 bg-slate-800 text-white flex flex-col">
+        <div className="p-6">
+          <h1 className="text-xl font-bold flex items-center gap-2"><FileCheck className="text-blue-400" /> 수학 평가 관리</h1>
+        </div>
+        <nav className="flex-1 px-4 space-y-2">
+          <button onClick={() => setActiveTab('students')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'students' ? 'bg-blue-600' : 'hover:bg-slate-700'}`}>
+            <Users size={20} /> 학생 명렬표 관리
+          </button>
+          <button onClick={() => setActiveTab('sessions')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'sessions' ? 'bg-blue-600' : 'hover:bg-slate-700'}`}>
+            <FileText size={20} /> 학습지(차시) 관리
+          </button>
+          <button onClick={() => setActiveTab('controls')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'controls' ? 'bg-blue-600' : 'hover:bg-slate-700'}`}>
+            <Settings size={20} /> 반별 제출 관리
+          </button>
+          <button onClick={() => setActiveTab('scores')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'scores' ? 'bg-blue-600' : 'hover:bg-slate-700'}`}>
+            <BarChart size={20} /> 실시간 성적 확인
+          </button>
+        </nav>
+        <div className="p-4 border-t border-slate-700">
+          <button onClick={logout} className="w-full flex items-center gap-3 px-4 py-2 text-slate-300 hover:text-white transition-colors">
+            <LogOut size={20} /> 로그아웃
+          </button>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-auto p-8 relative">
+        {activeTab === 'students' && <AdminStudents students={students} dbOps={dbOps} classActiveSettings={classActiveSettings} />}
+        {activeTab === 'sessions' && <AdminSessions sessions={sessions} dbOps={dbOps} />}
+        {activeTab === 'controls' && <AdminControls students={students} classActiveSettings={classActiveSettings} dbOps={dbOps} />}
+        {activeTab === 'scores' && <AdminScores students={students} sessions={sessions} />}
+      </div>
+    </div>
+  );
+}
+
+function AdminStudents({ students, dbOps, classActiveSettings }) {
+  const [bulkText, setBulkText] = useState('');
+  const [showGuide, setShowGuide] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+
+  const handleBulkAdd = async () => {
+    if (!bulkText.trim()) return;
+    setIsProcessing(true);
+
+    const lines = bulkText.split('\n');
+    const newStudents = [];
+    let newClassGroups = new Set();
+    
+    lines.forEach(line => {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length >= 4) {
+        const classGroup = parts[0];
+        const hakbun = parts[1];
+        const name = parts[2];
+        const code = parts[3];
+
+        newClassGroups.add(classGroup);
+
+        newStudents.push({
+          id: Math.random().toString(36).substring(2, 9),
+          classGroup: classGroup,
+          hakbun: hakbun,
+          name: name,
+          code: code,
+          scores: {}
+        });
+      }
+    });
+
+    if (newStudents.length > 0) {
+      const existingIds = students.map(s => s.hakbun);
+      const filteredNew = newStudents.filter(n => !existingIds.includes(n.hakbun));
+      
+      await dbOps.addStudents(filteredNew);
+
+      const updatedSettings = { ...classActiveSettings };
+      let settingsChanged = false;
+      newClassGroups.forEach(cg => {
+        if (updatedSettings[cg] === undefined) {
+          updatedSettings[cg] = true;
+          settingsChanged = true;
+        }
+      });
+      if (settingsChanged) {
+        await dbOps.updateClassSettings(updatedSettings);
+      }
+      
+      setBulkText('');
+    }
+    setIsProcessing(false);
+  };
+
+  return (
+    <div className="bg-white rounded-xl shadow-sm p-6">
+      <h2 className="text-2xl font-bold mb-6">학생 명렬표 클라우드 등록</h2>
+      
+      <div className="mb-8 bg-blue-50 p-4 rounded-lg border border-blue-100">
+        <div className="flex justify-between items-center mb-2">
+          <h3 className="font-semibold text-blue-800 flex items-center gap-2"><Upload size={18} /> 명렬표 붙여넣기</h3>
+          <button onClick={() => setShowGuide(!showGuide)} className="text-sm text-blue-600 underline">작성 방법 안내</button>
+        </div>
+        {showGuide && (
+          <p className="text-sm text-gray-600 mb-3 bg-white p-3 rounded border border-blue-200">
+            엑셀 파일에서 <strong>[반] [학번] [이름] [개인코드]</strong> 4개의 열을 복사하여 아래 빈칸에 붙여넣기 하세요.<br/>
+            예시:<br/>
+            경제A 30101 경다현 A001<br/>
+            경제B 30106 김혜인 A006
+          </p>
+        )}
+        <textarea
+          value={bulkText}
+          onChange={(e) => setBulkText(e.target.value)}
+          placeholder="경제A 30101 경다현 A001&#10;경제B 30106 김혜인 A006&#10;과 같이 입력하세요."
+          className="w-full h-32 p-3 border border-gray-300 rounded-lg mb-3 resize-none outline-none focus:ring-2 focus:ring-blue-500 font-mono"
+        />
+        <button onClick={handleBulkAdd} disabled={isProcessing} className="bg-blue-600 text-white px-4 py-2 rounded-lg font-medium hover:bg-blue-700 transition-colors disabled:opacity-50">
+          {isProcessing ? '클라우드 등록 중...' : '학생 일괄 등록'}
+        </button>
+      </div>
+
+      <div className="overflow-x-auto">
+        <table className="w-full text-left border-collapse">
+          <thead>
+            <tr className="bg-gray-100 text-gray-700 border-b-2 border-gray-200">
+              <th className="p-3 w-28">반</th>
+              <th className="p-3 w-32">학번</th>
+              <th className="p-3">이름</th>
+              <th className="p-3">개인코드 (로그인용)</th>
+              <th className="p-3 w-20">관리</th>
+            </tr>
+          </thead>
+          <tbody>
+            {students.length === 0 ? (
+              <tr><td colSpan="5" className="p-8 text-center text-gray-500">등록된 학생이 없습니다.</td></tr>
+            ) : (
+              students.sort((a,b) => a.classGroup.localeCompare(b.classGroup) || a.hakbun.localeCompare(b.hakbun)).map(student => (
+                <tr key={student.id} className="border-b hover:bg-gray-50">
+                  <td className="p-3 font-medium text-blue-800">{student.classGroup}</td>
+                  <td className="p-3 font-mono">{student.hakbun}</td>
+                  <td className="p-3 font-medium">{student.name}</td>
+                  <td className="p-3"><span className="bg-green-100 text-green-800 px-3 py-1 rounded font-mono font-bold tracking-wider">{student.code}</span></td>
+                  <td className="p-3">
+                    <button onClick={() => dbOps.deleteStudent(student.id)} className="text-red-500 hover:text-red-700 text-sm">삭제</button>
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function AdminSessions({ sessions, dbOps }) {
+  const [isAdding, setIsAdding] = useState(false);
+  const [newSession, setNewSession] = useState({ title: '', answers: ['', '', '', '', ''], pdfUrl: null });
+  const [uploadError, setUploadError] = useState('');
+
+  const handlePdfUpload = (e) => {
+    const file = e.target.files[0];
+    setUploadError('');
+    if (file && file.type === 'application/pdf') {
+      if (file.size > 800 * 1024) {
+         setUploadError('PDF 용량이 너무 큽니다 (최대 800KB). 용량을 줄이거나 PDF 없이 문제만 등록해 주세요.');
+         return;
+      }
+      
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setNewSession({ ...newSession, pdfUrl: reader.result });
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const handleSaveSession = async () => {
+    if (!newSession.title) return;
+    const sessionData = { ...newSession, id: 's' + Date.now() };
+    await dbOps.saveSession(sessionData);
+    setIsAdding(false);
+    setNewSession({ title: '', answers: ['', '', '', '', ''], pdfUrl: null });
+  };
+
+  return (
+    <div className="bg-white rounded-xl shadow-sm p-6">
+      <div className="flex justify-between items-center mb-6">
+        <h2 className="text-2xl font-bold">학습지(차시) 관리</h2>
+        <button onClick={() => setIsAdding(!isAdding)} className="bg-blue-600 text-white px-4 py-2 rounded-lg font-medium hover:bg-blue-700 transition-colors flex items-center gap-2">
+          <Plus size={18} /> 새 차시 등록
+        </button>
+      </div>
+
+      {isAdding && (
+        <div className="bg-gray-50 p-6 rounded-xl mb-8 border border-gray-200">
+          <h3 className="text-lg font-semibold mb-4">새 학습지 정보 입력</h3>
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">차시 제목</label>
+              <input type="text" value={newSession.title} onChange={e => setNewSession({...newSession, title: e.target.value})} placeholder="예: 2차시: 나머지 정리와 인수분해" className="w-full p-2 border rounded" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">PDF 학습지 업로드 (선택, 최대 800KB)</label>
+              <input type="file" accept=".pdf" onChange={handlePdfUpload} className="w-full p-2 border rounded bg-white" />
+              {uploadError && <p className="text-sm text-red-600 mt-1">{uploadError}</p>}
+              {newSession.pdfUrl && !uploadError && <p className="text-sm text-green-600 mt-1">PDF가 첨부되었습니다.</p>}
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">정답 입력 (5문항, 각 20점)</label>
+              <div className="flex gap-4">
+                {[0, 1, 2, 3, 4].map(idx => (
+                  <div key={idx} className="flex-1">
+                    <span className="block text-xs text-gray-500 mb-1">{idx + 1}번 정답</span>
+                    <input type="text" value={newSession.answers[idx]} onChange={e => {
+                      const newAnswers = [...newSession.answers];
+                      newAnswers[idx] = e.target.value;
+                      setNewSession({...newSession, answers: newAnswers});
+                    }} className="w-full p-2 border rounded text-center" />
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button onClick={() => setIsAdding(false)} className="px-4 py-2 text-gray-600 bg-gray-200 rounded hover:bg-gray-300">취소</button>
+              <button onClick={handleSaveSession} className="px-4 py-2 text-white bg-blue-600 rounded hover:bg-blue-700">저장하기</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        {sessions.map(session => (
+          <div key={session.id} className="border border-gray-200 rounded-xl p-5 hover:shadow-md transition-shadow relative bg-white">
+            <button onClick={() => dbOps.deleteSession(session.id)} className="absolute top-4 right-4 text-gray-400 hover:text-red-500">
+              <X size={20} />
+            </button>
+            <div className="w-10 h-10 bg-indigo-100 text-indigo-600 rounded-lg flex items-center justify-center mb-4">
+              <FileText size={20} />
+            </div>
+            <h3 className="font-bold text-lg mb-2">{session.title}</h3>
+            <p className="text-sm text-gray-500 mb-4">
+              {session.pdfUrl ? 'PDF 첨부됨' : 'PDF 미첨부'} • 5문항 (100점 만점)
+            </p>
+            <div className="bg-gray-50 p-2 rounded text-sm text-gray-700">
+              <span className="font-semibold">정답:</span> {session.answers.join(', ')}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AdminControls({ students, classActiveSettings, dbOps }) {
+  const classes = [...new Set(students.map(s => s.classGroup))].sort((a, b) => a.localeCompare(b));
+
+  const toggleClass = async (cls) => {
+    const newSettings = {
+      ...classActiveSettings,
+      [cls]: !classActiveSettings[cls]
+    };
+    await dbOps.updateClassSettings(newSettings);
+  };
+
+  return (
+    <div className="bg-white rounded-xl shadow-sm p-6 max-w-2xl">
+      <h2 className="text-2xl font-bold mb-2">반별 제출 활성화 관리 (실시간 연동)</h2>
+      <p className="text-gray-500 mb-6">스위치가 켜진(ON) 반의 학생들만 답안을 제출할 수 있습니다.</p>
+
+      {classes.length === 0 ? (
+        <div className="p-8 text-center text-gray-500 bg-gray-50 rounded-lg">등록된 학생이 없어 활성화할 반이 없습니다.</div>
+      ) : (
+        <div className="space-y-3">
+          {classes.map(cls => (
+            <div key={cls} className="flex items-center justify-between p-4 border border-gray-200 rounded-lg bg-gray-50 hover:bg-gray-100 transition-colors">
+              <span className="text-lg font-bold text-gray-800">{cls}</span>
+              <button 
+                onClick={() => toggleClass(cls)}
+                className={`flex items-center gap-2 px-4 py-2 rounded-full font-bold transition-colors ${classActiveSettings[cls] !== false ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}
+              >
+                {classActiveSettings[cls] !== false ? (
+                  <><ToggleRight size={24} /> 제출 ON</>
+                ) : (
+                  <><ToggleLeft size={24} /> 제출 OFF</>
+                )}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AdminScores({ students, sessions }) {
+  const classes = [...new Set(students.map(s => s.classGroup))].sort((a,b) => a.localeCompare(b));
+  const [selectedClass, setSelectedClass] = useState(classes[0] || '');
+
+  useEffect(() => {
+    if (!classes.includes(selectedClass) && classes.length > 0) {
+      setSelectedClass(classes[0]);
+    }
+  }, [classes, selectedClass]);
+
+  const filteredStudents = students.filter(s => s.classGroup === selectedClass).sort((a,b) => a.hakbun.localeCompare(b.hakbun));
+
+  return (
+    <div className="bg-white rounded-xl shadow-sm p-6">
+      <div className="flex justify-between items-center mb-6">
+        <h2 className="text-2xl font-bold">학급별 실시간 성적 확인</h2>
+        <select value={selectedClass} onChange={e => setSelectedClass(e.target.value)} className="p-2 border rounded-lg bg-gray-50 outline-none font-medium">
+          {classes.map(c => <option key={c} value={c}>{c} 성적 보기</option>)}
+        </select>
+      </div>
+
+      {classes.length === 0 ? (
+        <div className="text-center p-10 text-gray-500 border rounded-lg bg-gray-50">등록된 학생 데이터가 없습니다.</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-center border-collapse">
+            <thead>
+              <tr className="bg-gray-100 border-b-2 border-gray-200 text-sm">
+                <th className="p-3 w-28">학번</th>
+                <th className="p-3 w-32">이름</th>
+                <th className="p-3 w-24 font-bold text-blue-700 border-r border-gray-200">총점</th>
+                {sessions.map(s => (
+                  <th key={s.id} className="p-3 font-medium text-gray-700 min-w-[140px]">{s.title}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filteredStudents.map(student => {
+                let totalScore = 0;
+                sessions.forEach(s => {
+                  if (student.scores?.[s.id]) totalScore += student.scores[s.id].score;
+                });
+
+                return (
+                  <tr key={student.id} className="border-b hover:bg-gray-50">
+                    <td className="p-3 text-gray-500 font-mono">{student.hakbun}</td>
+                    <td className="p-3 font-medium">{student.name}</td>
+                    <td className="p-3 font-black text-blue-600 border-r border-gray-200">{totalScore}점</td>
+                    {sessions.map(s => {
+                      const submission = student.scores?.[s.id];
+                      return (
+                        <td key={s.id} className="p-3">
+                          {submission ? (
+                            <div className="flex flex-col items-center">
+                              <span className="text-blue-600 font-bold">{submission.score}점</span>
+                              <span className="text-xs text-gray-400 mt-1">{submission.submittedAt}</span>
+                            </div>
+                          ) : (
+                            <span className="text-gray-300 text-sm">미제출</span>
+                          )}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StudentDashboard({ currentUser, sessions, setView, setCurrentSessionId, logout, classActiveSettings }) {
+  const isClassActive = classActiveSettings[currentUser.classGroup] !== false; 
+  
+  let totalScore = 0;
+  sessions.forEach(s => {
+    if (currentUser.scores?.[s.id]) {
+      totalScore += currentUser.scores[s.id].score;
+    }
+  });
+
+  const handleStartTest = (sessionId) => {
+    setCurrentSessionId(sessionId);
+    setView('test');
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50 pb-10">
+      <header className="bg-white shadow-sm border-b px-6 py-4 flex justify-between items-center sticky top-0 z-10">
+        <div className="flex items-center gap-2">
+          <div className="w-8 h-8 bg-blue-600 text-white rounded-md flex items-center justify-center font-bold">M</div>
+          <span className="font-bold text-lg">나의 수학 학습장</span>
+        </div>
+        <div className="flex items-center gap-4">
+          <span className="text-gray-700 font-medium hidden sm:inline-block">
+            <span className="text-blue-800 font-bold mr-2">{currentUser.classGroup}</span>
+            <span className="font-mono text-gray-500 mr-1">{currentUser.hakbun}</span>
+            <span className="text-black font-bold">{currentUser.name}</span> 학생
+          </span>
+          <button onClick={logout} className="text-sm text-gray-500 hover:text-gray-800 flex items-center gap-1">
+            <LogOut size={16} /> 로그아웃
+          </button>
+        </div>
+      </header>
+
+      <main className="max-w-4xl mx-auto mt-8 px-4">
+        <div className="bg-gradient-to-r from-blue-600 to-indigo-600 rounded-2xl p-6 text-white shadow-lg mb-8 flex justify-between items-center">
+          <div>
+            <h2 className="text-xl font-bold opacity-90 mb-1">내 누적 총점</h2>
+            <p className="text-blue-100 text-sm">완료한 학습지의 합산 점수입니다.</p>
+          </div>
+          <div className="text-4xl font-black">{totalScore}<span className="text-2xl font-bold opacity-80 ml-1">점</span></div>
+        </div>
+
+        <h1 className="text-2xl font-bold mb-6">학습지 목록</h1>
+        <div className="grid gap-4">
+          {sessions.length === 0 ? (
+            <div className="bg-white p-10 text-center rounded-xl border border-gray-200 text-gray-500">등록된 학습지가 없습니다.</div>
+          ) : (
+            sessions.map(session => {
+              const submission = currentUser.scores?.[session.id];
+              const isCompleted = submission !== undefined;
+
+              return (
+                <div key={session.id} className={`bg-white p-6 rounded-xl shadow-sm border ${isCompleted ? 'border-green-200 bg-green-50/30' : 'border-gray-200'} flex flex-col sm:flex-row items-center justify-between gap-4 hover:shadow-md transition-shadow`}>
+                  <div className="flex items-center gap-4 w-full sm:w-auto">
+                    <div className={`w-12 h-12 shrink-0 rounded-full flex items-center justify-center ${isCompleted ? 'bg-green-100 text-green-600' : 'bg-blue-100 text-blue-600'}`}>
+                      {isCompleted ? <CheckCircle size={24} /> : <FileText size={24} />}
+                    </div>
+                    <div>
+                      <h3 className="text-lg font-bold text-gray-800">{session.title}</h3>
+                      {isCompleted ? (
+                         <p className="text-xs text-green-600 font-medium flex items-center gap-1 mt-1">
+                           <Clock size={12} /> 제출완료: {submission.submittedAt}
+                         </p>
+                      ) : (
+                         <p className="text-sm text-gray-500 mt-1">5문항 • 100점 만점</p>
+                      )}
+                    </div>
+                  </div>
+                  
+                  <div className="w-full sm:w-auto">
+                    {isCompleted ? (
+                      <div className="text-right sm:text-center w-full">
+                        <span className="block text-xs text-gray-500 mb-1">내 점수</span>
+                        <span className="text-2xl font-black text-green-600">{submission.score}점</span>
+                      </div>
+                    ) : (
+                      isClassActive ? (
+                        <button onClick={() => handleStartTest(session.id)} className="w-full sm:w-auto bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-semibold transition-colors shadow-sm">
+                          학습지 풀기
+                        </button>
+                      ) : (
+                        <button disabled className="w-full sm:w-auto bg-gray-300 text-gray-500 px-6 py-3 rounded-lg font-semibold cursor-not-allowed">
+                          제출 기간 아님
+                        </button>
+                      )
+                    )}
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
+
+function TestScreen({ currentUser, sessionId, sessions, dbOps, setView, testResult, setTestResult }) {
+  const session = sessions.find(s => s.id === sessionId);
+  const [answers, setAnswers] = useState(['', '', '', '', '']);
+  const [showConfirmModal, setShowConfirmModal] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  if (!session) return null;
+
+  const initiateSubmit = () => {
+    setShowConfirmModal(true);
+  };
+
+  const executeSubmit = async () => {
+    setIsSubmitting(true);
+    let score = 0;
+    session.answers.forEach((ans, idx) => {
+      if (ans.trim() === answers[idx].trim()) {
+        score += 20;
+      }
+    });
+
+    const submitTime = formatSubmitDate(); 
+
+    await dbOps.submitTest(currentUser.id, sessionId, { score: score, submittedAt: submitTime });
+
+    setIsSubmitting(false);
+    setShowConfirmModal(false);
+    setTestResult(score);
+  };
+
+  const handleCloseResultModal = () => {
+    setTestResult(null);
+    setView('student');
+  };
+
+  return (
+    <div className="flex h-screen bg-gray-100 overflow-hidden">
+      {showConfirmModal && (
+        <div className="fixed inset-0 bg-black/50 z-[100] flex items-center justify-center backdrop-blur-sm p-4">
+          <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-2xl">
+            <h3 className="text-xl font-bold text-gray-900 mb-2">최종 제출 확인</h3>
+            <p className="text-gray-600 mb-6">
+              제출 후에는 <strong className="text-red-500">절대 수정하거나 재제출할 수 없습니다.</strong><br/>
+              정말 제출하시겠습니까?
+            </p>
+            <div className="flex gap-3">
+              <button onClick={() => setShowConfirmModal(false)} className="flex-1 py-3 bg-gray-200 text-gray-800 rounded-lg font-bold hover:bg-gray-300">
+                취소
+              </button>
+              <button onClick={executeSubmit} disabled={isSubmitting} className="flex-1 py-3 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-700 disabled:opacity-50">
+                {isSubmitting ? '제출 중...' : '제출하기'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="absolute top-0 w-full h-14 bg-white border-b flex items-center justify-between px-4 z-20 shadow-sm">
+        <div className="font-bold flex items-center gap-2"><FileText className="text-blue-600" size={18}/> {session.title}</div>
+        <button onClick={() => setView('student')} className="text-sm text-gray-500 hover:bg-gray-100 px-3 py-1 rounded">나가기</button>
+      </div>
+
+      <div className="flex-1 mt-14 bg-gray-800 relative hidden md:block">
+        {session.pdfUrl ? (
+          <iframe src={`${session.pdfUrl}#toolbar=0`} className="w-full h-full border-none" title="PDF Viewer" />
+        ) : (
+          <div className="flex flex-col items-center justify-center h-full text-gray-400 space-y-4">
+            <FileText size={64} className="opacity-50" />
+            <p>교사님이 PDF 파일을 업로드하지 않았습니다.</p>
+            <p className="text-sm">종이 학습지를 보고 우측에 답을 입력하세요.</p>
+          </div>
+        )}
+      </div>
+
+      <div className="w-full md:w-80 bg-white mt-14 md:border-l shadow-[-4px_0_15px_rgba(0,0,0,0.05)] flex flex-col z-10">
+        <div className="p-4 bg-blue-50 border-b">
+          <h2 className="font-bold text-blue-900 text-center">답안 제출 (OMR)</h2>
+          <p className="text-xs text-center text-blue-600 mt-1">각 문항 20점 / 총 5문항</p>
+        </div>
+        
+        <div className="flex-1 overflow-auto p-6 space-y-6">
+          <div className="bg-red-50 text-red-600 p-3 rounded-lg text-xs font-semibold flex items-start gap-2 leading-tight">
+            <AlertCircle size={14} className="mt-0.5 shrink-0" />
+            <p>한 번 제출하면 <strong>절대 수정 및 재제출</strong>이 불가능합니다. 신중하게 입력하세요.</p>
+          </div>
+
+          {[0, 1, 2, 3, 4].map(idx => (
+            <div key={idx} className="flex flex-col">
+              <label className="text-sm font-bold text-gray-700 mb-2 flex items-center gap-2">
+                <span className="w-6 h-6 bg-gray-800 text-white rounded-full flex items-center justify-center text-xs">{idx + 1}</span>
+                번 문항 정답
+              </label>
+              <input
+                type="text"
+                value={answers[idx]}
+                onChange={e => {
+                  const newAnswers = [...answers];
+                  newAnswers[idx] = e.target.value;
+                  setAnswers(newAnswers);
+                }}
+                className="w-full p-3 border-2 border-gray-200 rounded-lg focus:border-blue-500 focus:ring-0 outline-none text-center text-lg font-semibold transition-colors"
+                placeholder="답 입력"
+              />
+            </div>
+          ))}
+        </div>
+
+        <div className="p-4 border-t bg-gray-50">
+          <button onClick={initiateSubmit} className="w-full py-4 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl text-lg transition-colors shadow-sm">
+            최종 제출하기
+          </button>
+        </div>
+      </div>
+
+      {testResult !== null && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center backdrop-blur-sm p-4">
+          <div className="bg-white p-8 rounded-2xl shadow-2xl max-w-sm w-full text-center transform animate-bounce-short">
+            <div className="w-20 h-20 bg-green-100 text-green-500 rounded-full flex items-center justify-center mx-auto mb-4">
+              <CheckCircle size={40} />
+            </div>
+            <h2 className="text-2xl font-bold text-gray-800 mb-2">채점 완료!</h2>
+            <p className="text-gray-600 mb-6">
+              제출이 완료되어 클라우드에 저장되었습니다.<br/>점수는<br/>
+              <span className="text-4xl font-black text-blue-600 mt-2 inline-block">{testResult}점</span> 입니다.
+            </p>
+            <button onClick={handleCloseResultModal} className="w-full py-3 bg-gray-800 text-white rounded-lg font-bold hover:bg-gray-900 transition-colors">
+              대시보드로 돌아가기
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
