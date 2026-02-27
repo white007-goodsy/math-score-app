@@ -441,6 +441,9 @@ function LoginScreen({ onAdminLogin, onStudentLogin }) {
     return (
       <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
         <div className="bg-white p-10 rounded-2xl shadow-xl w-full max-w-md text-center">
+          <div className="mt-8 pt-4 border-t text-xs text-gray-500">
+            © {new Date().getFullYear()} made by 수학교사 이수연
+          </div>
           <div className="w-16 h-16 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center mx-auto mb-6">
             <FileCheck size={32} />
           </div>
