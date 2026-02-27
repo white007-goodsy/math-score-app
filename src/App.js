@@ -995,6 +995,33 @@ function AdminScores({ students, sessions, dbOps }) {
     .filter((s) => s.classGroup === selectedClass)
     .sort((a, b) => a.hakbun.localeCompare(b.hakbun));
 
+  // ✅ CSV(엑셀) 다운로드
+  const escapeCSV = (v) => {
+    const s = (v ?? "").toString();
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+
+  const downloadScoresCSV = () => {
+    const headers = ["반", "학번", "이름", "총점", ...sessions.map((s) => s.title)];
+    const rows = filteredStudents.map((st) => {
+      const total = sessions.reduce((sum, s) => sum + (Number(st.scores?.[s.id]?.score) || 0), 0);
+      const perSession = sessions.map((s) => st.scores?.[s.id]?.score ?? "");
+      return [st.classGroup, st.hakbun, st.name, total, ...perSession];
+    });
+
+    // 엑셀 한글 깨짐 방지 BOM
+    const csv = "\ufeff" + [headers, ...rows].map((r) => r.map(escapeCSV).join(",")).join("\n");
+
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `성적_${selectedClass || "전체"}_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // ✅ 제출 초기화(재제출 허용)
   const resetOne = async (student, session) => {
     const ok = window.confirm(
       `${student.classGroup} ${student.hakbun} ${student.name} 학생의\n[${session.title}] 제출을 초기화할까요?\n(초기화 후 학생은 다시 제출할 수 있습니다)`
@@ -1007,21 +1034,34 @@ function AdminScores({ students, sessions, dbOps }) {
     <div className="bg-white rounded-xl shadow-sm p-6">
       <div className="flex justify-between items-center mb-6">
         <h2 className="text-2xl font-bold">학급별 실시간 성적 확인</h2>
-        <select
-          value={selectedClass}
-          onChange={(e) => setSelectedClass(e.target.value)}
-          className="p-2 border rounded-lg bg-gray-50 outline-none font-medium"
-        >
-          {classes.map((c) => (
-            <option key={c} value={c}>
-              {c} 성적 보기
-            </option>
-          ))}
-        </select>
+
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={downloadScoresCSV}
+            className="px-4 py-2 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700"
+          >
+            엑셀 다운로드(CSV)
+          </button>
+
+          <select
+            value={selectedClass}
+            onChange={(e) => setSelectedClass(e.target.value)}
+            className="p-2 border rounded-lg bg-gray-50 outline-none font-medium"
+          >
+            {classes.map((c) => (
+              <option key={c} value={c}>
+                {c} 성적 보기
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {classes.length === 0 ? (
-        <div className="text-center p-10 text-gray-500 border rounded-lg bg-gray-50">등록된 학생 데이터가 없습니다.</div>
+        <div className="text-center p-10 text-gray-500 border rounded-lg bg-gray-50">
+          등록된 학생 데이터가 없습니다.
+        </div>
       ) : (
         <div className="overflow-x-auto">
           <table className="w-full text-center border-collapse">
@@ -1031,12 +1071,13 @@ function AdminScores({ students, sessions, dbOps }) {
                 <th className="p-3 w-32">이름</th>
                 <th className="p-3 w-24 font-bold text-blue-700 border-r border-gray-200">총점</th>
                 {sessions.map((s) => (
-                  <th key={s.id} className="p-3 font-medium text-gray-700 min-w-[160px]">
+                  <th key={s.id} className="p-3 font-medium text-gray-700 min-w-[170px]">
                     {s.title}
                   </th>
                 ))}
               </tr>
             </thead>
+
             <tbody>
               {filteredStudents.map((student) => {
                 const totalScore = sessions.reduce(
@@ -1048,7 +1089,9 @@ function AdminScores({ students, sessions, dbOps }) {
                   <tr key={student.id} className="border-b hover:bg-gray-50">
                     <td className="p-3 text-gray-500 font-mono">{student.hakbun}</td>
                     <td className="p-3 font-medium">{student.name}</td>
-                    <td className="p-3 font-black text-blue-600 border-r border-gray-200">{totalScore}점</td>
+                    <td className="p-3 font-black text-blue-600 border-r border-gray-200">
+                      {totalScore}점
+                    </td>
 
                     {sessions.map((s) => {
                       const submission = student.scores?.[s.id];
@@ -1056,6 +1099,7 @@ function AdminScores({ students, sessions, dbOps }) {
                         <td key={s.id} className="p-3">
                           {submission ? (
                             <div className="flex flex-col items-center gap-1">
+                              {/* ✅ 점수 클릭 → 답안/정답/맞틀 모달 */}
                               <button
                                 type="button"
                                 onClick={() => setReviewTarget({ student, session: s, submission })}
@@ -1063,6 +1107,7 @@ function AdminScores({ students, sessions, dbOps }) {
                               >
                                 {submission.score}점
                               </button>
+
                               <span className="text-xs text-gray-400">{submission.submittedAt}</span>
 
                               {/* ✅ 초기화 버튼 */}
@@ -1088,6 +1133,7 @@ function AdminScores({ students, sessions, dbOps }) {
         </div>
       )}
 
+      {/* ✅ 답안 리뷰 모달(이미 파일 아래에 AnswerReviewModal이 있어야 함) */}
       <AnswerReviewModal
         open={Boolean(reviewTarget)}
         onClose={() => setReviewTarget(null)}
