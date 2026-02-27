@@ -8,7 +8,6 @@ import {
   Upload,
   Plus,
   Lock,
-  Key,
   FileCheck,
   X,
   Settings,
@@ -38,7 +37,6 @@ if (typeof canvasConfigStr === 'string') {
   }
 }
 
-const isCanvasEnv = Boolean(canvasConfig);
 
 // CRA(Create React App) + Vercel/로컬 실행에서는 REACT_APP_로 시작하는 환경변수를 사용합니다.
 const envConfig = {
