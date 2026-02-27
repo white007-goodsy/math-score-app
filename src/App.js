@@ -7,7 +7,6 @@ import {
   CheckCircle,
   Upload,
   Plus,
-  Lock,
   FileCheck,
   X,
   Settings,
@@ -23,6 +22,7 @@ import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
   getAuth,
   signInAnonymously,
+  signInWithCustomToken,   // ✅ 이 줄 추가
   onAuthStateChanged,
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
@@ -116,11 +116,6 @@ export default function App() {
   const [authErrorMsg, setAuthErrorMsg] = useState(''); // 통신 장애 에러 메시지 상태 추가
   const [view, setView] = useState('login'); // 'login', 'admin', 'student', 'test'
   const [currentUser, setCurrentUser] = useState(null);
-  const teacherLoginWithGoogle = async () => {
-    if (!auth) return;
-    const provider = new GoogleAuthProvider();
-    await signInWithPopup(auth, provider);
-  };
 
   const [teacherStatus, setTeacherStatus] = useState("none");
   // "none" | "pending" | "approved"
@@ -387,15 +382,6 @@ export default function App() {
     },
   };
 
-  const handleAdminLogin = (password) => {
-    if (password === 'admin1234') {
-      setCurrentUser({ role: 'admin' });
-      setView('admin');
-      return true;
-    }
-    return false;
-  };
-
   const handleStudentLogin = (code) => {
     const student = students.find((s) => s.code === code.toUpperCase());
     if (student) {
@@ -478,7 +464,7 @@ export default function App() {
         />
       )}
       {view === "teacherPending" && (
-        <TeacherPendingScreen email={teacherEmail} onLogout={teacherLogout} />
+        <TeacherPendingScreen email={teacherEmail} status={teacherStatus} onLogout={teacherLogout} />
       )}
       {view === 'admin' && (
         <AdminDashboard
@@ -486,7 +472,7 @@ export default function App() {
           dbOps={dbOps}
           sessions={sessions}
           classActiveSettings={classActiveSettings}
-          logout={logout}
+          logout={teacherLogout}
         />
       )}
       {view === 'student' && (
@@ -1712,10 +1698,13 @@ function AnswerReviewModal({ open, onClose, session, submission, studentLabel })
   );
 }
 
-function TeacherPendingScreen({ email, onLogout }) {
+function TeacherPendingScreen({ email, status, onLogout }) {
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50 p-6 text-center">
       <h2 className="text-2xl font-bold text-gray-800 mb-2">승인 대기 중</h2>
+      <p className="text-gray-500 mb-6">
+        상태: {status === "approved" ? "승인됨" : "승인대기"}
+      </p>
       <p className="text-gray-600 mb-6">
         교사 계정 <span className="font-mono font-bold">{email || "-"}</span> 은(는) 아직 관리자 승인이 필요합니다.
       </p>
