@@ -823,6 +823,7 @@ function AdminControls({ students, classActiveSettings, dbOps }) {
 function AdminScores({ students, sessions }) {
   const classes = [...new Set(students.map((s) => s.classGroup))].sort((a, b) => a.localeCompare(b));
   const [selectedClass, setSelectedClass] = useState(classes[0] || '');
+  const [reviewTarget, setReviewTarget] = useState(null);
 
   useEffect(() => {
     if (!classes.includes(selectedClass) && classes.length > 0) {
@@ -834,21 +835,63 @@ function AdminScores({ students, sessions }) {
     .filter((s) => s.classGroup === selectedClass)
     .sort((a, b) => a.hakbun.localeCompare(b.hakbun));
 
+  // ✅ 엑셀 다운로드용 CSV 생성
+  const escapeCSV = (v) => {
+    const s = (v ?? '').toString();
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+
+  const downloadScoresCSV = () => {
+    const headers = ['반', '학번', '이름', '총점', ...sessions.map((s) => s.title)];
+    const rows = filteredStudents.map((st) => {
+      const total = sessions.reduce((sum, s) => sum + (Number(st.scores?.[s.id]?.score) || 0), 0);
+      const perSession = sessions.map((s) => st.scores?.[s.id]?.score ?? '');
+      return [st.classGroup, st.hakbun, st.name, total, ...perSession];
+    });
+
+    const csv =
+      '\ufeff' +
+      [headers, ...rows]
+        .map((r) => r.map(escapeCSV).join(','))
+        .join('\n');
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `성적_${selectedClass || '전체'}_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <div className="bg-white rounded-xl shadow-sm p-6">
       <div className="flex justify-between items-center mb-6">
         <h2 className="text-2xl font-bold">학급별 실시간 성적 확인</h2>
-        <select
-          value={selectedClass}
-          onChange={(e) => setSelectedClass(e.target.value)}
-          className="p-2 border rounded-lg bg-gray-50 outline-none font-medium"
-        >
-          {classes.map((c) => (
-            <option key={c} value={c}>
-              {c} 성적 보기
-            </option>
-          ))}
-        </select>
+
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={downloadScoresCSV}
+            className="px-4 py-2 bg-green-600 text-white rounded-lg font-bold hover:bg-green-700"
+          >
+            엑셀 다운로드(CSV)
+          </button>
+
+          <select
+            value={selectedClass}
+            onChange={(e) => setSelectedClass(e.target.value)}
+            className="p-2 border rounded-lg bg-gray-50 outline-none font-medium"
+          >
+            {classes.map((c) => (
+              <option key={c} value={c}>
+                {c} 성적 보기
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {classes.length === 0 ? (
@@ -870,23 +913,31 @@ function AdminScores({ students, sessions }) {
             </thead>
             <tbody>
               {filteredStudents.map((student) => {
-                let totalScore = 0;
-                sessions.forEach((s) => {
-                  if (student.scores?.[s.id]) totalScore += student.scores[s.id].score;
-                });
+                const totalScore = sessions.reduce(
+                  (sum, s) => sum + (Number(student.scores?.[s.id]?.score) || 0),
+                  0
+                );
 
                 return (
                   <tr key={student.id} className="border-b hover:bg-gray-50">
                     <td className="p-3 text-gray-500 font-mono">{student.hakbun}</td>
                     <td className="p-3 font-medium">{student.name}</td>
                     <td className="p-3 font-black text-blue-600 border-r border-gray-200">{totalScore}점</td>
+
                     {sessions.map((s) => {
                       const submission = student.scores?.[s.id];
                       return (
                         <td key={s.id} className="p-3">
                           {submission ? (
                             <div className="flex flex-col items-center">
-                              <span className="text-blue-600 font-bold">{submission.score}점</span>
+                              {/* ✅ 점수 클릭하면 학생 답안/정답/맞틀 보기 */}
+                              <button
+                                type="button"
+                                onClick={() => setReviewTarget({ student, session: s, submission })}
+                                className="text-blue-600 font-bold hover:underline"
+                              >
+                                {submission.score}점
+                              </button>
                               <span className="text-xs text-gray-400 mt-1">{submission.submittedAt}</span>
                             </div>
                           ) : (
@@ -902,6 +953,18 @@ function AdminScores({ students, sessions }) {
           </table>
         </div>
       )}
+
+      <AnswerReviewModal
+        open={Boolean(reviewTarget)}
+        onClose={() => setReviewTarget(null)}
+        session={reviewTarget?.session}
+        submission={reviewTarget?.submission}
+        studentLabel={
+          reviewTarget?.student
+            ? `${reviewTarget.student.classGroup} ${reviewTarget.student.hakbun} ${reviewTarget.student.name}`
+            : ''
+        }
+      />
     </div>
   );
 }
@@ -909,12 +972,12 @@ function AdminScores({ students, sessions }) {
 function StudentDashboard({ currentUser, sessions, setView, setCurrentSessionId, logout, classActiveSettings }) {
   const isClassActive = classActiveSettings[currentUser.classGroup] !== false;
 
-  let totalScore = 0;
-  sessions.forEach((s) => {
-    if (currentUser.scores?.[s.id]) {
-      totalScore += currentUser.scores[s.id].score;
-    }
-  });
+  // ✅ 총점 계산을 scores 기준으로 안정적으로 계산
+  const [reviewTarget, setReviewTarget] = useState(null);
+  const totalScore = Object.values(currentUser.scores || {}).reduce(
+    (sum, v) => sum + (Number(v?.score) || 0),
+    0
+  );
 
   const handleStartTest = (sessionId) => {
     setCurrentSessionId(sessionId);
@@ -955,7 +1018,9 @@ function StudentDashboard({ currentUser, sessions, setView, setCurrentSessionId,
         <h1 className="text-2xl font-bold mb-6">학습지 목록</h1>
         <div className="grid gap-4">
           {sessions.length === 0 ? (
-            <div className="bg-white p-10 text-center rounded-xl border border-gray-200 text-gray-500">등록된 학습지가 없습니다.</div>
+            <div className="bg-white p-10 text-center rounded-xl border border-gray-200 text-gray-500">
+              등록된 학습지가 없습니다.
+            </div>
           ) : (
             sessions.map((session) => {
               const submission = currentUser.scores?.[session.id];
@@ -964,13 +1029,15 @@ function StudentDashboard({ currentUser, sessions, setView, setCurrentSessionId,
               return (
                 <div
                   key={session.id}
-                  className={`bg-white p-6 rounded-xl shadow-sm border ${isCompleted ? 'border-green-200 bg-green-50/30' : 'border-gray-200'
-                    } flex flex-col sm:flex-row items-center justify-between gap-4 hover:shadow-md transition-shadow`}
+                  className={`bg-white p-6 rounded-xl shadow-sm border ${
+                    isCompleted ? 'border-green-200 bg-green-50/30' : 'border-gray-200'
+                  } flex flex-col sm:flex-row items-center justify-between gap-4 hover:shadow-md transition-shadow`}
                 >
                   <div className="flex items-center gap-4 w-full sm:w-auto">
                     <div
-                      className={`w-12 h-12 shrink-0 rounded-full flex items-center justify-center ${isCompleted ? 'bg-green-100 text-green-600' : 'bg-blue-100 text-blue-600'
-                        }`}
+                      className={`w-12 h-12 shrink-0 rounded-full flex items-center justify-center ${
+                        isCompleted ? 'bg-green-100 text-green-600' : 'bg-blue-100 text-blue-600'
+                      }`}
                     >
                       {isCompleted ? <CheckCircle size={24} /> : <FileText size={24} />}
                     </div>
@@ -990,7 +1057,14 @@ function StudentDashboard({ currentUser, sessions, setView, setCurrentSessionId,
                     {isCompleted ? (
                       <div className="text-right sm:text-center w-full">
                         <span className="block text-xs text-gray-500 mb-1">내 점수</span>
-                        <span className="text-2xl font-black text-green-600">{submission.score}점</span>
+                        {/* ✅ 점수 클릭하면 답안/정답/맞틀 보기 */}
+                        <button
+                          type="button"
+                          onClick={() => setReviewTarget({ session, submission })}
+                          className="text-2xl font-black text-green-600 hover:underline"
+                        >
+                          {submission.score}점
+                        </button>
                       </div>
                     ) : isClassActive ? (
                       <button
@@ -1014,6 +1088,14 @@ function StudentDashboard({ currentUser, sessions, setView, setCurrentSessionId,
           )}
         </div>
       </main>
+
+      <AnswerReviewModal
+        open={Boolean(reviewTarget)}
+        onClose={() => setReviewTarget(null)}
+        session={reviewTarget?.session}
+        submission={reviewTarget?.submission}
+        studentLabel="내 제출"
+      />
     </div>
   );
 }
@@ -1041,7 +1123,12 @@ function TestScreen({ currentUser, sessionId, sessions, dbOps, setView, testResu
 
     const submitTime = formatSubmitDate();
 
-    await dbOps.submitTest(currentUser.id, sessionId, { score, submittedAt: submitTime });
+    // ✅ 핵심: 학생이 입력한 답(answers)을 같이 저장
+    await dbOps.submitTest(currentUser.id, sessionId, {
+      score,
+      submittedAt: submitTime,
+      answers: [...answers],
+    });
 
     setIsSubmitting(false);
     setShowConfirmModal(false);
@@ -1065,7 +1152,10 @@ function TestScreen({ currentUser, sessionId, sessions, dbOps, setView, testResu
               정말 제출하시겠습니까?
             </p>
             <div className="flex gap-3">
-              <button onClick={() => setShowConfirmModal(false)} className="flex-1 py-3 bg-gray-200 text-gray-800 rounded-lg font-bold hover:bg-gray-300">
+              <button
+                onClick={() => setShowConfirmModal(false)}
+                className="flex-1 py-3 bg-gray-200 text-gray-800 rounded-lg font-bold hover:bg-gray-300"
+              >
                 취소
               </button>
               <button
@@ -1084,7 +1174,10 @@ function TestScreen({ currentUser, sessionId, sessions, dbOps, setView, testResu
         <div className="font-bold flex items-center gap-2">
           <FileText className="text-blue-600" size={18} /> {session.title}
         </div>
-        <button onClick={() => setView('student')} className="text-sm text-gray-500 hover:bg-gray-100 px-3 py-1 rounded">
+        <button
+          onClick={() => setView('student')}
+          className="text-sm text-gray-500 hover:bg-gray-100 px-3 py-1 rounded"
+        >
           나가기
         </button>
       </div>
@@ -1104,9 +1197,7 @@ function TestScreen({ currentUser, sessionId, sessions, dbOps, setView, testResu
       <div className="w-full md:w-80 bg-white mt-14 md:border-l shadow-[-4px_0_15px_rgba(0,0,0,0.05)] flex flex-col z-10">
         <div className="p-4 bg-blue-50 border-b">
           <h2 className="font-bold text-blue-900 text-center">답안 제출 (OMR)</h2>
-          <p className="text-xs text-center text-blue-600 mt-1">
-            각 문항 20점 / 총 5문항
-          </p>
+          <p className="text-xs text-center text-blue-600 mt-1">각 문항 20점 / 총 5문항</p>
         </div>
 
         <div className="flex-1 overflow-auto p-6 space-y-6">
@@ -1120,7 +1211,9 @@ function TestScreen({ currentUser, sessionId, sessions, dbOps, setView, testResu
           {[0, 1, 2, 3, 4].map((idx) => (
             <div key={idx} className="flex flex-col">
               <label className="text-sm font-bold text-gray-700 mb-2 flex items-center gap-2">
-                <span className="w-6 h-6 bg-gray-800 text-white rounded-full flex items-center justify-center text-xs">{idx + 1}</span>
+                <span className="w-6 h-6 bg-gray-800 text-white rounded-full flex items-center justify-center text-xs">
+                  {idx + 1}
+                </span>
                 번 문항 정답
               </label>
               <input
@@ -1156,8 +1249,10 @@ function TestScreen({ currentUser, sessionId, sessions, dbOps, setView, testResu
             </div>
             <h2 className="text-2xl font-bold text-gray-800 mb-2">채점 완료!</h2>
             <p className="text-gray-600 mb-6">
-              제출이 완료되어 클라우드에 저장되었습니다.<br />
-              점수는<br />
+              제출이 완료되어 클라우드에 저장되었습니다.
+              <br />
+              점수는
+              <br />
               <span className="text-4xl font-black text-blue-600 mt-2 inline-block">{testResult}점</span> 입니다.
             </p>
             <button
@@ -1169,6 +1264,96 @@ function TestScreen({ currentUser, sessionId, sessions, dbOps, setView, testResu
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function AnswerReviewModal({ open, onClose, session, submission, studentLabel }) {
+  if (!open) return null;
+
+  const totalQ = session?.answers?.length || 0;
+  const unitScore = totalQ > 0 ? 100 / totalQ : 0;
+
+  const normalize = (v) => (v ?? '').toString().trim();
+
+  const studentAnswers = Array.isArray(submission?.answers) ? submission.answers : null;
+  const correctAnswers = Array.isArray(session?.answers) ? session.answers : [];
+
+  const rows = correctAnswers.map((correct, idx) => {
+    const my = studentAnswers ? studentAnswers[idx] : '';
+    const isCorrect = normalize(my) === normalize(correct);
+    return { no: idx + 1, my, correct, isCorrect };
+  });
+
+  const computedScore = Math.round(
+    rows.reduce((sum, r) => sum + (r.isCorrect ? unitScore : 0), 0)
+  );
+
+  return (
+    <div className="fixed inset-0 bg-black/60 z-[200] flex items-center justify-center p-4">
+      <div className="bg-white w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden">
+        <div className="px-6 py-4 border-b flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-lg font-bold text-gray-900">{session?.title || '학습지'}</h3>
+            <p className="text-sm text-gray-500 mt-1">
+              {studentLabel ? <span className="font-medium text-gray-700">{studentLabel} · </span> : null}
+              제출: {submission?.submittedAt || '-'} · 점수:{' '}
+              <span className="font-bold text-blue-600">{submission?.score ?? computedScore}점</span>
+            </p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-700">
+            <X size={22} />
+          </button>
+        </div>
+
+        <div className="p-6">
+          {!studentAnswers ? (
+            <div className="bg-yellow-50 border border-yellow-200 text-yellow-800 p-4 rounded-lg text-sm">
+              이 제출 기록에는 <strong>학생 답안(answers)</strong>이 저장되어 있지 않습니다.
+              <br />
+              (이 기능 추가 이전에 제출된 기록일 수 있어요.)
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse text-sm">
+                <thead>
+                  <tr className="bg-gray-100 border-b">
+                    <th className="p-3 w-16 text-center">번호</th>
+                    <th className="p-3 text-center">학생 답</th>
+                    <th className="p-3 text-center">정답</th>
+                    <th className="p-3 w-24 text-center">채점</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r) => (
+                    <tr key={r.no} className="border-b">
+                      <td className="p-3 text-center font-mono">{r.no}</td>
+                      <td className="p-3 text-center font-semibold">{r.my}</td>
+                      <td className="p-3 text-center font-semibold text-gray-700">{r.correct}</td>
+                      <td className="p-3 text-center">
+                        {r.isCorrect ? (
+                          <span className="inline-flex items-center gap-1 text-green-600 font-bold">
+                            <CheckCircle size={16} /> 정답
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 text-red-600 font-bold">
+                            <X size={16} /> 오답
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+
+              <div className="mt-4 text-right text-sm text-gray-600">
+                자동채점 기준: 문항당 {totalQ ? (100 / totalQ).toFixed(1) : '0'}점 · 재계산 점수:{' '}
+                <span className="font-bold">{computedScore}점</span>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
