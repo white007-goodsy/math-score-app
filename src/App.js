@@ -20,7 +20,15 @@ import {
 
 // --- Firebase 클라우드 연동 임포트 ---
 import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import {
+  getAuth,
+  signInAnonymously,
+  signInWithCustomToken,
+  onAuthStateChanged,
+  GoogleAuthProvider,
+  signInWithPopup
+  signOut
+} from "firebase/auth";
 import {
   getFirestore,
   collection,
@@ -108,6 +116,11 @@ export default function App() {
   const [authErrorMsg, setAuthErrorMsg] = useState(''); // 통신 장애 에러 메시지 상태 추가
   const [view, setView] = useState('login'); // 'login', 'admin', 'student', 'test'
   const [currentUser, setCurrentUser] = useState(null);
+  const teacherLoginWithGoogle = async () => {
+    if (!auth) return;
+    const provider = new GoogleAuthProvider();
+    await signInWithPopup(auth, provider);
+  };
 
   // --- 클라우드 실시간 데이터 저장소 ---
   const [students, setStudents] = useState([]);
@@ -380,7 +393,13 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-800 font-sans">
-      {view === 'login' && <LoginScreen onAdminLogin={handleAdminLogin} onStudentLogin={handleStudentLogin} />}
+      {view === "login" && (
+        <LoginScreen
+          onTeacherGoogleLogin={teacherLoginWithGoogle}
+          onStudentLogin={handleStudentLogin}
+          teacherDeniedInfo={teacherDeniedInfo}
+        />
+      )}
       {view === 'admin' && (
         <AdminDashboard
           students={students}
@@ -419,53 +438,79 @@ export default function App() {
 // UI 컴포넌트들 (LoginScreen, AdminDashboard 등)
 // ---------------------------------------------------------
 
-function LoginScreen({ onAdminLogin, onStudentLogin }) {
+function LoginScreen({ onTeacherGoogleLogin, onStudentLogin, teacherDeniedInfo }) {
   const [mode, setMode] = useState(null);
-  const [inputValue, setInputValue] = useState('');
-  const [error, setError] = useState('');
+  const [inputValue, setInputValue] = useState("");
+  const [error, setError] = useState("");
 
-  const handleSubmit = (e) => {
+  const handleStudentSubmit = (e) => {
     e.preventDefault();
-    setError('');
-
-    if (mode === 'admin') {
-      const success = onAdminLogin(inputValue);
-      if (!success) setError('비밀번호가 일치하지 않습니다.');
-    } else if (mode === 'student') {
-      const success = onStudentLogin(inputValue);
-      if (!success) setError('유효하지 않은 개인코드입니다. 대소문자를 확인해 주세요.');
-    }
+    setError("");
+    const success = onStudentLogin(inputValue);
+    if (!success) setError("유효하지 않은 개인코드입니다. 대소문자를 확인해 주세요.");
   };
 
   if (!mode) {
     return (
       <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
         <div className="bg-white p-10 rounded-2xl shadow-xl w-full max-w-md text-center">
-          <div className="mt-8 pt-4 border-t text-xs text-gray-500">
-            © {new Date().getFullYear()} made by 수학교사 이수연
-          </div>
-          <div className="w-16 h-16 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center mx-auto mb-6">
-            <FileCheck size={32} />
-          </div>
           <h1 className="text-3xl font-bold text-gray-800 mb-2">수학 평가 시스템</h1>
-          <p className="text-green-600 font-semibold mb-8 flex justify-center items-center gap-1 text-sm">
-            <CheckCircle size={16} /> 클라우드 실시간 동기화 ON
-          </p>
 
-          <div className="space-y-4">
+          <div className="space-y-4 mt-8">
             <button
-              onClick={() => setMode('student')}
-              className="w-full py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold text-lg transition-colors flex items-center justify-center gap-2"
+              onClick={() => setMode("student")}
+              className="w-full py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold text-lg transition-colors"
             >
-              <Users size={24} /> 학생 로그인
+              학생 로그인
             </button>
+
             <button
-              onClick={() => setMode('admin')}
-              className="w-full py-4 bg-white border-2 border-gray-200 hover:border-gray-300 text-gray-700 rounded-xl font-semibold text-lg transition-colors flex items-center justify-center gap-2"
+              onClick={() => setMode("teacher")}
+              className="w-full py-4 bg-white border-2 border-gray-200 hover:border-gray-300 text-gray-700 rounded-xl font-semibold text-lg transition-colors"
             >
-              <Lock size={24} /> 교사 로그인
+              교사 로그인
             </button>
           </div>
+
+          <div className="mt-8 pt-4 border-t text-xs text-gray-500">
+            © {new Date().getFullYear()} 제작: 수학교사 이수연
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (mode === "teacher") {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
+        <div className="bg-white p-10 rounded-2xl shadow-xl w-full max-w-md">
+          <button
+            onClick={() => setMode(null)}
+            className="text-sm text-gray-500 hover:text-gray-800 mb-6"
+          >
+            ← 뒤로 가기
+          </button>
+
+          <h2 className="text-2xl font-bold text-gray-800 mb-4 text-center">교사 로그인</h2>
+
+          <button
+            onClick={onTeacherGoogleLogin}
+            className="w-full py-4 bg-gray-900 hover:bg-black text-white rounded-xl font-bold transition-colors"
+          >
+            Google로 로그인
+          </button>
+
+          {teacherDeniedInfo && (
+            <div className="mt-4 p-4 rounded-lg bg-yellow-50 border border-yellow-200 text-sm text-yellow-800">
+              <div className="font-bold mb-1">교사 권한이 없습니다.</div>
+              <div>관리자에게 아래 정보를 보내서 교사 등록을 요청하세요.</div>
+              <div className="mt-2 font-mono text-xs">
+                UID: {teacherDeniedInfo.uid}
+                <br />
+                Email: {teacherDeniedInfo.email || "-"}
+              </div>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -477,31 +522,31 @@ function LoginScreen({ onAdminLogin, onStudentLogin }) {
         <button
           onClick={() => {
             setMode(null);
-            setError('');
-            setInputValue('');
+            setError("");
+            setInputValue("");
           }}
-          className="text-sm text-gray-500 hover:text-gray-800 mb-6 flex items-center gap-1"
+          className="text-sm text-gray-500 hover:text-gray-800 mb-6"
         >
           ← 뒤로 가기
         </button>
-        <h2 className="text-2xl font-bold text-gray-800 mb-6 text-center">
-          {mode === 'admin' ? '교사 로그인' : '학생 로그인'}
-        </h2>
-        <form onSubmit={handleSubmit} className="space-y-4">
+
+        <h2 className="text-2xl font-bold text-gray-800 mb-6 text-center">학생 로그인</h2>
+
+        <form onSubmit={handleStudentSubmit} className="space-y-4">
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              {mode === 'admin' ? '관리자 비밀번호' : '부여받은 개인코드 (4자리)'}
-            </label>
+            <label className="block text-sm font-medium text-gray-700 mb-1">부여받은 개인코드 (4자리)</label>
             <input
-              type={mode === 'admin' ? 'password' : 'text'}
+              type="text"
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
-              placeholder={mode === 'admin' ? '비밀번호 입력 (기본: admin1234)' : '예: A001'}
-              className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none uppercase"
+              placeholder="예: A001"
+              className="w-full px-4 py-3 border border-gray-300 rounded-lg outline-none uppercase"
               autoFocus
             />
           </div>
+
           {error && <p className="text-red-500 text-sm">{error}</p>}
+
           <button
             type="submit"
             className="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold transition-colors"
