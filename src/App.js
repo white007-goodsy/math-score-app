@@ -37,7 +37,10 @@ import {
   getDoc,
   deleteDoc,
   updateDoc,
-  deleteField
+  deleteField,
+  query,
+  where,
+  getDocs
 } from "firebase/firestore";
 
 // --- 환경 감지 및 Firebase 설정 ---
@@ -121,6 +124,8 @@ export default function App() {
   // "none" | "pending" | "approved"
   const [teacherEmail, setTeacherEmail] = useState("");
   // --- 클라우드 실시간 데이터 저장소 ---
+  const [tenantId, setTenantId] = useState(null);      // 교사 UID가 들어감
+  const [teacherCode, setTeacherCode] = useState("");  // 학생이 입력할 “교사코드”
   const [students, setStudents] = useState([]);
   const [sessions, setSessions] = useState([]);
   const [classActiveSettings, setClassActiveSettings] = useState({});
@@ -143,10 +148,15 @@ export default function App() {
             ? window.__initial_auth_token
             : null;
 
+        // 이미 이메일/비번 등으로 로그인된 경우(교사)에는 익명 로그인으로 덮어쓰지 않습니다.
+        if (auth.currentUser && !auth.currentUser.isAnonymous) {
+          return;
+        }
+
         if (initialAuthToken) {
-          signInWithCustomToken(auth, initialAuthToken);
+          await signInWithCustomToken(auth, initialAuthToken);
         } else {
-          signInAnonymously(auth);
+          await signInAnonymously(auth);
         }
       } catch (error) {
         console.error('인증 오류:', error);
@@ -180,6 +190,8 @@ export default function App() {
       // 익명 로그인(학생용)인 경우는 교사 체크 안 함
       if (firebaseUser.isAnonymous) {
         setTeacherStatus("none");
+        setTenantId(null);
+        setTeacherCode("");
         return;
       }
 
@@ -200,11 +212,26 @@ export default function App() {
       const status = snap.data()?.status || "pending";
 
       if (status === "approved") {
+        const tid = firebaseUser.uid;
+        const code = tid.slice(0, 8).toUpperCase(); // 학생 로그인용 교사코드
+
         setTeacherStatus("approved");
-        setCurrentUser({ role: "admin", uid: firebaseUser.uid, email });
+        setTenantId(tid);
+        setTeacherCode(code);
+
+        // teacherCode -> tenantId 매핑(학생 로그인에서 사용)
+        await setDoc(
+          doc(db, "artifacts", currentAppId, "public", "data", "teacherIndex", code),
+          { tenantId: tid, email, updatedAt: Date.now() },
+          { merge: true }
+        );
+
+        setCurrentUser({ role: "admin", uid: tid, email });
         setView("admin");
       } else {
         setTeacherStatus("pending");
+        setTenantId(null);
+        setTeacherCode("");
         setView("teacherPending");
       }
     };
@@ -214,48 +241,28 @@ export default function App() {
   }, [firebaseUser]);
 
   useEffect(() => {
-    if (!firebaseUser || !db) return;
+    if (!firebaseUser || !db || !tenantId) return;
 
-    // 클라우드 컬렉션 경로 지정
-    const studentsRef = collection(db, 'artifacts', currentAppId, 'public', 'data', 'students');
-    const sessionsRef = collection(db, 'artifacts', currentAppId, 'public', 'data', 'sessions');
-    const settingsRef = collection(db, 'artifacts', currentAppId, 'public', 'data', 'settings');
+    // 테넌트 바뀌면 로딩 다시
+    setIsDbReady(false);
+    setStudents([]);
+    setSessions([]);
+    setClassActiveSettings({});
 
-    // 실시간 구독
-    const unsubStudents = onSnapshot(
-      studentsRef,
-      (snap) => {
-        setStudents(snap.docs.map((d) => d.data()));
-      },
-      (err) => console.error(err)
-    );
+    const studentsRef = collection(db, "artifacts", currentAppId, "tenants", tenantId, "public", "data", "students");
+    const sessionsRef = collection(db, "artifacts", currentAppId, "tenants", tenantId, "public", "data", "sessions");
+    const settingsRef = collection(db, "artifacts", currentAppId, "tenants", tenantId, "public", "data", "settings");
 
-    const unsubSessions = onSnapshot(
-      sessionsRef,
-      (snap) => {
-        setSessions(snap.docs.map((d) => d.data()));
-      },
-      (err) => console.error(err)
-    );
+    const unsubStudents = onSnapshot(studentsRef, (snap) => setStudents(snap.docs.map((d) => d.data())));
+    const unsubSessions = onSnapshot(sessionsRef, (snap) => setSessions(snap.docs.map((d) => d.data())));
+    const unsubSettings = onSnapshot(settingsRef, (snap) => {
+      const docSnap = snap.docs.find((d) => d.id === "classActiveSettings");
+      if (docSnap) setClassActiveSettings(docSnap.data());
+      setIsDbReady(true);
+    });
 
-    const unsubSettings = onSnapshot(
-      settingsRef,
-      (snap) => {
-        const docSnap = snap.docs.find((d) => d.id === 'classActiveSettings');
-        if (docSnap) {
-          setClassActiveSettings(docSnap.data());
-        }
-        setIsDbReady(true);
-      },
-      (err) => console.error(err)
-    );
-
-    return () => {
-      unsubStudents();
-      unsubSessions();
-      unsubSettings();
-    };
-  }, [firebaseUser]);
+    return () => { unsubStudents(); unsubSessions(); unsubSettings(); };
+  }, [firebaseUser, tenantId]);
 
   const teacherSignup = async (email, password) => {
     if (!auth || !db) return;
@@ -283,42 +290,58 @@ export default function App() {
 
   const teacherLogout = async () => {
     if (!auth) return;
+
     await signOut(auth);
-    // 학생 기능 유지하려면 익명 로그인으로 복귀
-    await signInAnonymously(auth);
+
+    // 학생 기능 유지하려면 익명 로그인으로 복귀 (실패해도 앱은 login으로 이동)
+    try {
+      await signInAnonymously(auth);
+    } catch (e) {
+      console.warn("익명 로그인 복귀 실패:", e);
+    }
+
     setTeacherStatus("none");
     setTeacherEmail("");
     setCurrentUser(null);
+
+    // 테넌트/데이터 초기화
+    setTenantId(null);
+    setTeacherCode("");
+    setStudents([]);
+    setSessions([]);
+    setClassActiveSettings({});
+    setIsDbReady(false);
+
     setView("login");
   };
 
   // --- 2. 클라우드 데이터베이스 쓰기 함수 묶음 ---
   const dbOps = {
     addStudents: async (newStudents) => {
-      if (!db) return;
+      if (!db || !tenantId) return;
       for (const student of newStudents) {
-        await setDoc(doc(db, "artifacts", currentAppId, "public", "data", "students", student.id), student);
+        await setDoc(doc(db, "artifacts", currentAppId, "tenants", tenantId, "public", "data", "students", student.id), student);
       }
     },
 
     deleteStudent: async (id) => {
-      if (!db) return;
-      await deleteDoc(doc(db, "artifacts", currentAppId, "public", "data", "students", id));
+      if (!db || !tenantId) return;
+      await deleteDoc(doc(db, "artifacts", currentAppId, "tenants", tenantId, "public", "data", "students", id));
     },
 
     saveSession: async (session) => {
-      if (!db) return;
-      await setDoc(doc(db, "artifacts", currentAppId, "public", "data", "sessions", session.id), session);
+      if (!db || !tenantId) return;
+      await setDoc(doc(db, "artifacts", currentAppId, "tenants", tenantId, "public", "data", "sessions", session.id), session);
     },
 
     deleteSession: async (id) => {
-      if (!db) return;
-      await deleteDoc(doc(db, "artifacts", currentAppId, "public", "data", "sessions", id));
+      if (!db || !tenantId) return;
+      await deleteDoc(doc(db, "artifacts", currentAppId, "tenants", tenantId, "public", "data", "sessions", id));
     },
 
     // ✅ 반×학습지 제출 설정 저장 (v2 구조로 정규화해서 저장)
     updateClassSettings: async (rawSettings) => {
-      if (!db) return;
+      if (!db || !tenantId) return;
 
       const reserved = new Set(["version", "defaultByClass", "bySession", "updatedAt"]);
       const input = rawSettings && typeof rawSettings === "object" ? rawSettings : {};
@@ -334,7 +357,7 @@ export default function App() {
           updatedAt: Date.now(),
         };
         await setDoc(
-          doc(db, "artifacts", currentAppId, "public", "data", "settings", "classActiveSettings"),
+          doc(db, "artifacts", currentAppId, "tenants", tenantId, "public", "data", "settings", "classActiveSettings"),
           normalized
         );
         return;
@@ -356,19 +379,19 @@ export default function App() {
       };
 
       await setDoc(
-        doc(db, "artifacts", currentAppId, "public", "data", "settings", "classActiveSettings"),
+        doc(db, "artifacts", currentAppId, "tenants", tenantId, "public", "data", "settings", "classActiveSettings"),
         normalized
       );
     },
 
     // ✅ 학생 제출 저장 (scoreData에 answers도 포함 가능)
     submitTest: async (studentId, sessionId, scoreData) => {
-      if (!db) return;
+      if (!db || !tenantId) return;
       const student = students.find((s) => s.id === studentId);
       if (!student) return;
       const updatedStudent = { ...student, scores: { ...student.scores, [sessionId]: scoreData } };
       await setDoc(
-        doc(db, "artifacts", currentAppId, "public", "data", "students", studentId),
+        doc(db, "artifacts", currentAppId, "tenants", tenantId, "public", "data", "students", studentId),
         updatedStudent,
         { merge: true }
       );
@@ -376,26 +399,57 @@ export default function App() {
 
     // ✅ 제출 초기화(삭제) = 다시 제출 가능
     resetSubmission: async (studentId, sessionId) => {
-      if (!db) return;
-      await updateDoc(doc(db, "artifacts", currentAppId, "public", "data", "students", studentId), {
+      if (!db || !tenantId) return;
+      await updateDoc(doc(db, "artifacts", currentAppId, "tenants", tenantId, "public", "data", "students", studentId), {
         [`scores.${sessionId}`]: deleteField(),
       });
     },
   };
 
-  const handleStudentLogin = (code) => {
-    const student = students.find((s) => s.code === code.toUpperCase());
-    if (student) {
-      setCurrentUser({ role: 'student', ...student });
-      setView('student');
+  const handleStudentLogin = async (teacherCodeInput, codeInput) => {
+    if (!db) return false;
+
+    const tcode = (teacherCodeInput || "").trim().toUpperCase();
+    const code = (codeInput || "").trim().toUpperCase();
+    if (!tcode || !code) return false;
+
+    try {
+      // 1) teacherCode -> tenantId
+      const idxRef = doc(db, "artifacts", currentAppId, "public", "data", "teacherIndex", tcode);
+      const idxSnap = await getDoc(idxRef);
+      if (!idxSnap.exists()) return false;
+
+      const tid = idxSnap.data()?.tenantId;
+      if (!tid) return false;
+
+      setTenantId(tid);
+      setTeacherCode(tcode);
+
+      // 2) 해당 테넌트에서 학생코드 검색
+      const studentsCol = collection(db, "artifacts", currentAppId, "tenants", tid, "public", "data", "students");
+      const q = query(studentsCol, where("code", "==", code));
+      const res = await getDocs(q);
+      if (res.empty) return false;
+
+      const student = res.docs[0].data();
+      setCurrentUser({ role: "student", ...student });
+      setView("student");
       return true;
+    } catch (e) {
+      console.error("학생 로그인 조회 실패:", e);
+      return false;
     }
-    return false;
   };
 
   const logout = () => {
     setCurrentUser(null);
-    setView('login');
+    setView("login");
+    setTenantId(null);
+    setTeacherCode("");
+    setStudents([]);
+    setSessions([]);
+    setClassActiveSettings({});
+    setIsDbReady(false);
   };
 
   const getUpdatedCurrentUser = () => {
@@ -445,7 +499,8 @@ export default function App() {
   }
 
   // 3. 정상 로딩 중 화면
-  if (!isDbReady) {
+  const needsData = view === "admin" || view === "student" || view === "test";
+  if (needsData && !isDbReady) {
     return (
       <div className="flex flex-col items-center justify-center min-h-screen bg-gray-50">
         <Loader className="animate-spin text-blue-600 mb-4" size={48} />
@@ -474,6 +529,7 @@ export default function App() {
           sessions={sessions}
           classActiveSettings={classActiveSettings}
           logout={teacherLogout}
+          teacherCode={teacherCode}
         />
       )}
       {view === 'student' && (
@@ -509,6 +565,7 @@ function LoginScreen({ onTeacherLogin, onTeacherSignup, onStudentLogin }) {
   const [mode, setMode] = useState(null); // null | "student" | "teacher"
   const [email, setEmail] = useState("");
   const [pw, setPw] = useState("");
+  const [teacherCodeInput, setTeacherCodeInput] = useState("");
   const [studentCode, setStudentCode] = useState("");
   const [isSignup, setIsSignup] = useState(false);
   const [error, setError] = useState("");
@@ -523,11 +580,11 @@ function LoginScreen({ onTeacherLogin, onTeacherSignup, onStudentLogin }) {
     }
   };
 
-  const submitStudent = (e) => {
+  const submitStudent = async (e) => {
     e.preventDefault();
     setError("");
-    const ok = onStudentLogin(studentCode);
-    if (!ok) setError("유효하지 않은 개인코드입니다.");
+    const ok = await onStudentLogin(teacherCodeInput, studentCode);
+    if (!ok) setError("교사코드 또는 개인코드(학생코드)가 올바르지 않습니다.");
   };
 
   if (!mode) {
@@ -633,6 +690,13 @@ function LoginScreen({ onTeacherLogin, onTeacherSignup, onStudentLogin }) {
 
         <form onSubmit={submitStudent} className="space-y-4">
           <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">교사코드</label>
+            <input
+              value={teacherCodeInput}
+              onChange={(e) => setTeacherCodeInput(e.target.value)}
+              className="w-full px-4 py-3 border border-gray-300 rounded-lg outline-none uppercase mb-3"
+              placeholder="예: 1A2B3C4D"
+            />
             <label className="block text-sm font-medium text-gray-700 mb-1">개인코드</label>
             <input
               value={studentCode}
@@ -654,7 +718,7 @@ function LoginScreen({ onTeacherLogin, onTeacherSignup, onStudentLogin }) {
   );
 }
 
-function AdminDashboard({ students, dbOps, sessions, classActiveSettings, logout }) {
+function AdminDashboard({ students, dbOps, sessions, classActiveSettings, logout, teacherCode }) {
   const [activeTab, setActiveTab] = useState('students');
 
   return (
@@ -664,6 +728,12 @@ function AdminDashboard({ students, dbOps, sessions, classActiveSettings, logout
           <h1 className="text-xl font-bold flex items-center gap-2">
             <FileCheck className="text-blue-400" /> 수학 평가 관리
           </h1>
+          {teacherCode ? (
+            <div className="mt-2 text-xs text-slate-300">
+              교사코드: <span className="font-mono font-bold text-white">{teacherCode}</span>
+              <div className="text-[10px] text-slate-400 mt-1">학생 로그인 시 교사코드 + 개인코드 입력</div>
+            </div>
+          ) : null}
         </div>
         <nav className="flex-1 px-4 space-y-2">
           <button
