@@ -210,7 +210,8 @@ export default function App() {
     };
 
     run();
-  }, [firebaseUser, db]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [firebaseUser]);
 
   useEffect(() => {
     if (!firebaseUser || !db) return;
